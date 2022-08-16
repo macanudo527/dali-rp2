@@ -171,6 +171,7 @@ class InputPlugin(AbstractInputPlugin):
         self.__cache_key: str = f"{self.__BINANCE_COM.lower()}-{account_holder}"
         self.client: binance = binance(
             {
+                "enableRateLimit": True,
                 "apiKey": api_key,
                 "secret": api_secret,
             }
@@ -915,6 +916,7 @@ class InputPlugin(AbstractInputPlugin):
         # Fiat deposits can also be pulled via CCXT fetch_withdrawls by cycling through legal_money
         # Using the underlying api endpoint is faster for Binance.
         # Note that this is the same endpoint as deposits, but with _TRANSACTION_TYPE set to 1 (for withdrawls)
+        # TODO backoff when hitting ddos?
         fiat_withdrawals = self.client.sapiGetFiatOrders(params=({_TRANSACTION_TYPE: 1, _START_TIME: self.start_time_ms, _END_TIME: now_time}))
         #    {
         #      "code": "000000",
@@ -953,7 +955,7 @@ class InputPlugin(AbstractInputPlugin):
             in_transaction_list.append(
                 InTransaction(
                     plugin=self.__BINANCE_COM,
-                    unique_id=transaction[_ORDER_NO],
+                    unique_id=Keyword.UNKNOWN.value,
                     raw_data=json.dumps(transaction),
                     timestamp=self._rp2_timestamp_from_ms_epoch(transaction[_CREATE_TIME]),
                     asset=transaction[_CRYPTOCURRENCY],
@@ -998,7 +1000,7 @@ class InputPlugin(AbstractInputPlugin):
                     out_transaction_list.append(
                         OutTransaction(
                             plugin=self.__BINANCE_COM,
-                            unique_id=transaction[_ID],
+                            unique_id=Keyword.UNKNOWN.value,
                             raw_data=json.dumps(transaction),
                             timestamp=self._rp2_timestamp_from_ms_epoch(transaction[_TIMESTAMP]),
                             asset=transaction[_FEE][_CURRENCY],
@@ -1030,7 +1032,7 @@ class InputPlugin(AbstractInputPlugin):
                 in_transaction_list.append(
                     InTransaction(
                         plugin=self.__BINANCE_COM,
-                        unique_id=transaction[_ID],
+                        unique_id=Keyword.UNKNOWN.value,
                         raw_data=json.dumps(transaction),
                         timestamp=self._rp2_timestamp_from_ms_epoch(transaction[_TIMESTAMP]),
                         asset=in_asset,
@@ -1050,7 +1052,6 @@ class InputPlugin(AbstractInputPlugin):
 
             else:
                 transaction_notes = f"Buy side of conversion from " f"{conversion_info}" f"({out_asset} out-transaction unique id: {transaction[_ID]}"
-
                 in_transaction_list.append(
                     InTransaction(
                         plugin=self.__BINANCE_COM,
@@ -1072,7 +1073,6 @@ class InputPlugin(AbstractInputPlugin):
                 )
 
     def _process_deposit(self, transaction: Any, in_transaction_list: List[InTransaction], notes: Optional[str] = None) -> None:
-
         amount: RP2Decimal = RP2Decimal(transaction[_INDICATED_AMOUNT])
         fee: RP2Decimal = RP2Decimal(transaction[_TOTAL_FEE])
         notes = f"{notes + '; ' if notes else ''}{'Fiat Deposit of '}; {transaction[_FIAT_CURRENCY]}"
@@ -1125,10 +1125,14 @@ class InputPlugin(AbstractInputPlugin):
             amount = RP2Decimal(transaction[_AMOUNT])
             notes = f"{notes + '; ' if notes else ''}{transaction[_EN_INFO]}"
 
+            # Just in case binance changes it's format in the future, let's check if it looks like a transaction hash
+            if re.search(r"^([A-Fa-f0-9]{64})$", transaction[_ID]):
+                self.__logger.info(f"Transaction ID could be a network hash {transaction[_ID]} is a valid unique id")
+
             in_transaction_list.append(
                 InTransaction(
                     plugin=self.__BINANCE_COM,
-                    unique_id=str(transaction[_ID]),  # Binance sometimes has two ids for one tranid
+                    unique_id=Keyword.UNKNOWN.value,  # Binance sometimes has two ids for one tranid
                     raw_data=json.dumps(transaction),
                     timestamp=self._rp2_timestamp_from_ms_epoch(transaction[_DIV_TIME]),
                     asset=transaction[_ASSET],
@@ -1177,7 +1181,7 @@ class InputPlugin(AbstractInputPlugin):
             out_transaction_list.append(
                 OutTransaction(
                     plugin=self.__BINANCE_COM,
-                    unique_id=transaction[_ID],
+                    unique_id=Keyword.UNKNOWN.value,
                     raw_data=json.dumps(transaction),
                     timestamp=self._rp2_timestamp_from_ms_epoch(transaction[_TIMESTAMP]),
                     asset=out_asset,
@@ -1200,7 +1204,7 @@ class InputPlugin(AbstractInputPlugin):
             out_transaction_list.append(
                 OutTransaction(
                     plugin=self.__BINANCE_COM,
-                    unique_id=transaction[_ID],
+                    unique_id=Keyword.UNKNOWN.value,
                     raw_data=json.dumps(transaction),
                     timestamp=self._rp2_timestamp_from_ms_epoch(transaction[_TIMESTAMP]),
                     asset=out_asset,
@@ -1273,7 +1277,7 @@ class InputPlugin(AbstractInputPlugin):
         out_transaction_list.append(
             OutTransaction(
                 plugin=self.__BINANCE_COM,
-                unique_id=transaction[_ORDER_NO],
+                unique_id=Keyword.UNKNOWN.value,
                 raw_data=json.dumps(transaction),
                 timestamp=self._rp2_timestamp_from_ms_epoch(transaction[_CREATE_TIME]),
                 asset=transaction[_FIAT_CURRENCY],
