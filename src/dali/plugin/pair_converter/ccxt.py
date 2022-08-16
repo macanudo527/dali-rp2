@@ -17,18 +17,7 @@ from datetime import datetime, timedelta
 from time import sleep, time
 from typing import Any, Dict, List, NamedTuple, Optional, Union
 
-from ccxt import (
-    DDoSProtection,
-    Exchange,
-    ExchangeError,
-    ExchangeNotAvailable,
-    NetworkError,
-    RequestTimeout,
-    binance,
-    cex,
-    kraken,
-    liquid,
-)
+from ccxt import DDoSProtection, Exchange, ExchangeError, ExchangeNotAvailable, NetworkError, RequestTimeout, binance, cex, kraken, liquid, gateio, coinbase
 from rp2.logger import create_logger
 from rp2.rp2_decimal import RP2Decimal
 
@@ -37,9 +26,9 @@ from dali.configuration import Keyword
 from dali.historical_bar import HistoricalBar
 
 # Native format keywords
-_ID: str = "id"
-_BASE: str = "base"
-_QUOTE: str = "quote"
+_MARKET_ID: str = "id"
+_MARKET_BASE: str = "base"
+_MARKET_QUOTE: str = "quote"
 
 # Time in ms
 _MINUTE: str = "1m"
@@ -56,9 +45,11 @@ _BINANCE: str = "Binance.com"
 _CEX: str = "CEX.IO"
 _KRAKEN: str = "Kraken"
 _LIQUID: str = "Liquid"
+_GATE = "Gate"
+_COINBASE = "Coinbase"
 _FIAT_EXCHANGE: str = "Exchangerate.host"
 _DEFAULT_EXCHANGE: str = "Binance.com"
-_EXCHANGE_DICT: Dict[str, Any] = {_BINANCE: binance, _CEX: cex, _KRAKEN: kraken, _LIQUID: liquid}
+_EXCHANGE_DICT: Dict[str, Any] = {_BINANCE: binance, _CEX: cex, _KRAKEN: kraken, _LIQUID: liquid, _GATE: gateio, _COINBASE: coinbase}
 
 # Delay in fractional seconds before making a request to avoid too many request errors
 # Kraken states it has a limit of 1 call per second, but this doesn't seem to be correct.
@@ -68,8 +59,27 @@ _EXCHANGE_DICT: Dict[str, Any] = {_BINANCE: binance, _CEX: cex, _KRAKEN: kraken,
 _REQUEST_DELAYDICT: Dict[str, float] = {_BINANCE: 0.0, _KRAKEN: 5.1, _LIQUID: 0}
 
 # Alternative Markets and exchanges for stablecoins or untradeable assets
-_ALTMARKET_EXCHANGES_DICT: Dict[str, str] = {"GUSDUSD": _CEX, "SOLOXRP": _LIQUID, "USDTUSD": _KRAKEN}
-_ALTMARKET_BY_BASE_DICT: Dict[str, str] = {"GUSD": "USD", "SOLO": "XRP", "USDT": "USD"}
+_ALTMARKET_EXCHANGES_DICT: Dict[str, str] = {
+    "GUSDUSD": _CEX,
+    "SOLOXRP": _LIQUID,
+    "USDTUSD": _KRAKEN,
+    "SGBUSD": _KRAKEN,
+    "ATDUSDT": _GATE,
+    "BSVUSDT": _GATE,
+    "BOBAUSD": _COINBASE,
+    "EDGUSDT": _GATE,
+}
+
+_ALTMARKET_BY_BASE_DICT: Dict[str, str] = {
+    "GUSD": "USD",
+    "SOLO": "XRP",
+    "USDT": "USD",
+    "ATD": "USDT",
+    "BSV": "USDT",
+    "SGB": "USD",
+    "BOBA": "USD",
+    "EDG": "USDT",
+}
 
 # Time constants
 _MS_IN_SECOND: int = 1000
@@ -83,6 +93,17 @@ class AssetPairAndHistoricalPrice(NamedTuple):
     to_asset: str
     exchange: str
     historical_data: Optional[HistoricalBar] = None
+
+
+"""
+It's sometimes helpful to jump in an `ipython` session to debug specific price issues. Here are some helpful snippets:
+
+converter = dali.plugin.pair_converter.ccxt.PairConverterPlugin(Keyword.HISTORICAL_PRICE_HIGH.value)
+converter._cache_exchange_data()
+# Note that `datetime.datetime.now()` isn't a good choice, most exchanges won't be able to return a value for the current / future time
+converter.get_historic_bar_from_native_source(datetime.datetime.fromisoformat("2021-08-14 07:48:40"), "BTC", "USD", "Binance.com")
+markets = converter._PairConverterPlugin__exchanges['Gate'].fetch_markets()
+"""
 
 
 class PairConverterPlugin(AbstractPairConverterPlugin):
@@ -161,61 +182,18 @@ class PairConverterPlugin(AbstractPairConverterPlugin):
             return self._get_fiat_exchange_rate(timestamp, from_asset, to_asset)
 
         if exchange == Keyword.UNKNOWN.value:
+            self.__logger.debug(f"Using default exchange {_DEFAULT_EXCHANGE} type for {exchange}")
             exchange = _DEFAULT_EXCHANGE
 
-        # Caching of exchanges
-        if exchange not in self.__exchanges:
-            if exchange in _EXCHANGE_DICT:
-                current_exchange: Exchange = _EXCHANGE_DICT[exchange]()
-                # key: market, value: exchanges where the market is available in order of priority
-                current_markets: Dict[str, List[str]] = {}
-                current_graph: Dict[str, Dict[str, None]] = {}
+        if exchange not in _EXCHANGE_DICT:
+            # self.__logger.error("WARNING: Unrecognized Exchange: %s. Please open an issue at %s", exchange, self.issues_url)
+            self.__logger.error(f"Exchange {exchange} not supported, using default exchange {_DEFAULT_EXCHANGE}")
+            exchange = _DEFAULT_EXCHANGE
 
-                for market in current_exchange.fetch_markets():
-                    self.__logger.debug("Market: %s", market)
-                    current_markets[f"{market[_BASE]}{market[_QUOTE]}"] = [exchange]
+        self._cache_exchange_data()
 
-                    # TO BE IMPLEMENTED - lazy build graph only if needed
-
-                    # Add the quote asset to the graph if it isn't there already.
-                    if current_graph.get(market[_BASE]) and (market[_QUOTE] not in current_graph[market[_BASE]]):
-                        current_graph[market[_BASE]][market[_QUOTE]] = None
-                    else:
-                        current_graph[market[_BASE]] = {market[_QUOTE]: None}
-
-                # TO BE IMPLEMENTED - possibly sort the lists to put the main stable coin first.
-
-                # Add alternative markets if they don't exist
-                for base_asset, quote_asset in _ALTMARKET_BY_BASE_DICT.items():
-                    alt_market = base_asset + quote_asset
-                    alt_exchange_name = _ALTMARKET_EXCHANGES_DICT[alt_market]
-
-                    # TO BE IMPLEMENTED - Add alt market to the end of list if another exchange exists already
-                    current_markets[alt_market] = [alt_exchange_name]
-
-                    # Cache the exchange so that we can pull prices from it later
-                    if alt_exchange_name not in self.__exchanges:
-                        alt_exchange: Exchange = _EXCHANGE_DICT[alt_exchange_name]()
-                        self.__exchanges[alt_exchange_name] = alt_exchange
-
-                    if current_graph.get(base_asset) and (quote_asset not in current_graph[base_asset]):
-                        current_graph[base_asset][quote_asset] = None
-                    else:
-                        current_graph[base_asset] = {quote_asset: None}
-
-                self._add_fiat_edges_to_graph(current_graph, current_markets)
-                self.__logger.debug("Added graph for %s : %s", current_exchange, current_graph)
-                self.__exchanges[exchange] = current_exchange
-                self.__exchange_markets[exchange] = current_markets
-                self.__exchange_graphs[exchange] = current_graph
-
-            else:
-                self.__logger.error("WARNING: Unrecognized Exchange: %s. Please open an issue at %s", exchange, self.issues_url)
-                return None
-        else:
-            current_exchange = self.__exchanges[exchange]
-            current_markets = self.__exchange_markets[exchange]
-            current_graph = self.__exchange_graphs[exchange]
+        current_markets = self.__exchange_markets[exchange]
+        current_graph = self.__exchange_graphs[exchange]
 
         market_symbol = from_asset + to_asset
         result: Optional[HistoricalBar] = None
@@ -295,6 +273,58 @@ class PairConverterPlugin(AbstractPairConverterPlugin):
 
         return result
 
+    def _cache_exchange_data(self) -> None:
+        if self.__exchanges:
+            self.__logger.debug("Exchange data already cached.")
+            return None
+
+        # first, initialize all exchanges so we use a consistent initialization approach
+        for exchange in _EXCHANGE_DICT:
+            # initializes the cctx exchange instance which is used to get the historical data
+            # https://docs.ccxt.com/en/latest/manual.html#notes-on-rate-limiter
+            self.__exchanges[exchange] = _EXCHANGE_DICT[exchange]({"enableRateLimit": True})
+
+        for exchange in _EXCHANGE_DICT:
+            self.__logger.debug("Caching markets for exchange %s", exchange)
+
+            # key: market, value: exchanges where the market is available in order of priority
+            current_markets: Dict[str, List[str]] = {}
+            current_graph: Dict[str, Dict[str, None]] = {}
+            current_exchange = self.__exchanges[exchange]
+
+            for market in current_exchange.fetch_markets():
+                self.__logger.debug("Building routes for market: %s", market[_MARKET_ID])
+
+                current_markets[f"{market[_MARKET_BASE]}{market[_MARKET_QUOTE]}"] = [exchange]
+
+                # TO BE IMPLEMENTED - lazy build graph only if needed
+
+                # Add the quote asset to the graph if it isn't there already.
+                if current_graph.get(market[_MARKET_BASE]) and (market[_MARKET_QUOTE] not in current_graph[market[_MARKET_BASE]]):
+                    current_graph[market[_MARKET_BASE]][market[_MARKET_QUOTE]] = None
+                else:
+                    current_graph[market[_MARKET_BASE]] = {market[_MARKET_QUOTE]: None}
+
+            # TO BE IMPLEMENTED - possibly sort the lists to put the main stable coin first.
+
+            # Add alternative markets if they don't exist
+            for base_asset, quote_asset in _ALTMARKET_BY_BASE_DICT.items():
+                alt_market = base_asset + quote_asset
+                alt_exchange_name = _ALTMARKET_EXCHANGES_DICT[alt_market]
+
+                # TO BE IMPLEMENTED - Add alt market to the end of list if another exchange exists already
+                current_markets[alt_market] = [alt_exchange_name]
+
+                if current_graph.get(base_asset) and (quote_asset not in current_graph[base_asset]):
+                    current_graph[base_asset][quote_asset] = None
+                else:
+                    current_graph[base_asset] = {quote_asset: None}
+
+            self._add_fiat_edges_to_graph(current_graph, current_markets)
+            self.__logger.debug("Added graph for %s : %s", current_exchange, current_graph)
+            self.__exchange_markets[exchange] = current_markets
+            self.__exchange_graphs[exchange] = current_graph
+
     def find_historical_bar(self, from_asset: str, to_asset: str, timestamp: datetime, exchange: str) -> Optional[HistoricalBar]:
         result: Optional[HistoricalBar] = None
         retry_count: int = 0
@@ -324,18 +354,17 @@ class PairConverterPlugin(AbstractPairConverterPlugin):
                     self.__logger.debug(
                         "Exception from server, most likely too many requests. Making another attempt after 0.1 second delay. Exception - %s", exc
                     )
-                    # logger INFO for retry?
-                    sleep(0.1)
-                    request_count += 3
-                except (ExchangeNotAvailable, NetworkError, RequestTimeout) as exc_na:
+                    sleep(10)
                     request_count += 1
-                    if request_count > 9:
+                except (ExchangeNotAvailable, NetworkError, RequestTimeout) as exc_na:
+                    self.__logger.debug("Server not available. Making attempt #%s of 10 after a ten second delay. Exception - %s", request_count, exc_na)
+
+                    sleep(10)
+                    request_count += 1
+                finally:
+                    if request_count >= 9:
                         self.__logger.info("Maximum number of retries reached. Saving to cache and exiting.")
                         self.save_historical_price_cache()
-                        raise Exception("Server error") from exc_na
-
-                    self.__logger.debug("Server not available. Making attempt #%s of 10 after a ten second delay. Exception - %s", request_count, exc_na)
-                    sleep(10)
 
             # If there is no candle the list will be empty
             if historical_data:
