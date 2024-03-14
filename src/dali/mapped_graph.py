@@ -157,21 +157,32 @@ class MappedGraph(Graph[ValueType]):
                 optimized: bool = False
                 if original_vertex.name in set(optimization.keys()):
                     neighbor_weight = optimization[original_vertex.name].pop(neighbor.name, original_vertex.get_weight(neighbor))
+                    if original_vertex.name == "OP":
+                        LOGGER.debug("OP: %s neighbor: %s", neighbor_weight, neighbor.name)
                     optimized = True
                 else:
                     neighbor_weight = original_vertex.get_weight(neighbor)
+                    if original_vertex.name == "OP":
+                        LOGGER.debug("not in optimizations OP: %s neighbor: %s", neighbor_weight, neighbor.name)
 
                 # Delete neighbor if negative weight
                 if neighbor_weight >= 0.0:
                     cloned_mapped_graph.add_neighbor(original_vertex.name, neighbor.name, neighbor_weight, optimized)
+                    if original_vertex.name == "OP":
+                        LOGGER.debug("OP: added neighbor: %s", neighbor.name)
                 else:
                     cloned_mapped_graph.add_vertex_if_missing(original_vertex.name)
+                    if original_vertex.name == "OP":
+                        LOGGER.debug("OP: did not add neighbor: %s", neighbor.name)
 
             # Add new neighbors
             for optimized_asset, neighbor_weights in optimization.items():
                 for neighbor_name in neighbor_weights.keys():
                     if original_vertex.name == optimized_asset:
                         cloned_mapped_graph.add_neighbor(original_vertex.name, neighbor_name, neighbor_weights[neighbor_name])
+                    else:
+                        # Add back previously deleted vertexes
+                        cloned_mapped_graph.add_neighbor(optimized_asset, neighbor_name, neighbor_weights[neighbor_name], True)
 
         return cloned_mapped_graph
 

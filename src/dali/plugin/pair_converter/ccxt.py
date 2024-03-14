@@ -130,15 +130,18 @@ _ALT_MARKET_EXCHANGES_DICT: Dict[str, str] = {
     "BSVUSDT": _GATE,
     "BOBAUSDT": _GATE,
     "BUSDUSDT": _BINANCE,
+    "CAKEUSDT": _BINANCE,
     "CYBERUSDT": _BINANCE,
     "EDGUSDT": _GATE,
     "ETHWUSD": _KRAKEN,
     "MAVUSDT": _BINANCE,
     "NEXOUSDT": _BITFINEX,  # To be replaced with Huobi once a CSV plugin is available
+    "OPUSDT": _BINANCE,
     "RVNUSDT": _BINANCE,
     "SEIUSDT": _BINANCE,
     "SGBUSD": _KRAKEN,
     "SOLOUSDT": _GATE,  # To be replaced with Binance or Huobi once a CSV plugin is available
+    "SWEATUSDT": _OKEX,
     "USDTUSD": _KRAKEN,
     "XYMUSDT": _GATE,
 }
@@ -152,15 +155,18 @@ _ALT_MARKET_BY_BASE_DICT: Dict[str, str] = {
     "BOBA": "USDT",
     "BSV": "USDT",
     "BUSD": "USDT",
+    "CAKE": "USDT",
     "CYBER": "USDT",
     "EDG": "USDT",
     "ETHW": "USD",
     "MAV": "USDT",
     "NEXO": "USDT",
+    "OP": "USDT",
     "RVN": "USDT",
     "SEI": "USDT",
     "SGB": "USD",
     "SOLO": "USDT",
+    "SWEAT": "USDT",
     "USDT": "USD",
     "XYM": "USDT",
 }
@@ -298,7 +304,8 @@ class PairConverterPlugin(AbstractPairConverterPlugin):
         pricing_path: Optional[Iterator[Vertex[str]]] = None
 
         # TO BE IMPLEMENTED - bypass routing if conversion can be done with one market on the exchange
-        if market_symbol in current_markets:
+        # TO BE IMPLEMENTED - start dates for markets in mapped_graph
+        if market_symbol in current_markets and market_symbol not in "OPUSDT":
             self.__logger.debug("Found market - %s on single exchange, skipping routing.", market_symbol)
             result = self.find_historical_bar(from_asset, to_asset, timestamp, current_markets[market_symbol][0])
             return result
@@ -573,8 +580,10 @@ class PairConverterPlugin(AbstractPairConverterPlugin):
                         self.__kraken_warning = True
                     elif exchange != "Kraken":  # This is a different exchange that is having pricing issues, so warn the user.
                         self.__logger.info(
-                            "The most accurate candle was not able to be used for pricing the asset %s at %s. The %s candle for %s was used. "
-                            "The price may be inaccurate. If you feel like you're getting this message in error, please open an issue at %s",
+                            "The most accurate candle was not able to be used for pricing the asset %s at %s. \n"
+                            "The %s candle for %s was used. \n"
+                            "The price may be inaccurate. If you feel like you're getting this message in error, \n"
+                            "please open an issue at %s",
                             from_asset,
                             timestamp,
                             timeframe,
@@ -809,25 +818,29 @@ class PairConverterPlugin(AbstractPairConverterPlugin):
                 if bar_check:
                     # We pad the first part of the graph in case an asset has been airdropped or otherwise given to a user before a
                     # market becomes available. Later, when the price is retrieved, the timestamps won't match and the user will be warned.
-                    no_market_padding: HistoricalBar = HistoricalBar(
-                        duration=bar_check[0].duration,
-                        timestamp=bar_check[0].timestamp - timedelta(weeks=1),
-                        open=bar_check[0].open,
-                        high=bar_check[0].high,
-                        low=bar_check[0].low,
-                        close=bar_check[0].close,
-                        volume=bar_check[0].volume,
-                    )
-                    bar_check = [no_market_padding] + bar_check
+                    # no_market_padding: HistoricalBar = HistoricalBar(
+                    #     duration=bar_check[0].duration,
+                    #     timestamp=bar_check[0].timestamp - timedelta(weeks=1),
+                    #     open=bar_check[0].open,
+                    #     high=bar_check[0].high,
+                    #     low=bar_check[0].low,
+                    #     close=bar_check[0].close,
+                    #     volume=bar_check[0].volume,
+                    # )
+                    # bar_check = [no_market_padding] + bar_check
 
                     child_bars[child_name][neighbor.name] = bar_check
+                    if child_name not in optimizations[week_start_date]:
+                        optimizations[week_start_date][child_name] = {}
+                    if neighbor.name not in optimizations[week_start_date][child_name]:
+                        optimizations[week_start_date][child_name][neighbor.name] = -1.0
                     timestamp_diff: float = (child_bars[child_name][neighbor.name][0].timestamp - start_date).total_seconds()
 
                     # Find the start of the market if it is after the first transaction
                     if timestamp_diff > _TIME_GRANULARITY_STRING_TO_SECONDS[_ONE_WEEK]:
                         market_starts[child_name][neighbor.name] = child_bars[child_name][neighbor.name][0].timestamp
                     else:
-                        market_starts[child_name][neighbor.name] = week_start_date - timedelta(weeks=1)
+                        market_starts[child_name][neighbor.name] = week_start_date # - timedelta(weeks=1)
                 else:
                     # This is a bogus market, either the exchange is misreporting it or it is not available from first transaction datetime
                     # By setting the start date far into the future this market will be deleted from the graph snapshots
