@@ -274,6 +274,7 @@ class AbstractCcxtPairConverterPlugin(AbstractPairConverterPlugin):
         untradeable_assets: Optional[str] = None,
         aliases: Optional[str] = None,
         cache_modifier: Optional[str] = None,
+        kraken_csv_update_file: Optional[str] = None,
     ) -> None:
         exchange_cache_modifier = "_".join(default_exchange.replace(" ", "_") if default_exchange and exchange_locked else "")
         cache_modifier = cache_modifier if cache_modifier else ""
@@ -291,6 +292,7 @@ class AbstractCcxtPairConverterPlugin(AbstractPairConverterPlugin):
         self.__csv_pricing_dict: Dict[str, Any] = _CSV_PRICING_DICT
         self.__default_csv_reader: ExchangeNameAndClass = ExchangeNameAndClass(_KRAKEN, _CSV_PRICING_DICT[_KRAKEN])
         self.__exchange_csv_reader: Dict[str, Any] = {}
+        self.__kraken_csv_update_file: Optional[str] = kraken_csv_update_file
 
         # key: name of exchange, value: AVLTree of all snapshots of the graph
         # TO BE IMPLEMENTED - Combine all graphs into one graph where assets can 'teleport' between exchanges
@@ -546,7 +548,7 @@ class AbstractCcxtPairConverterPlugin(AbstractPairConverterPlugin):
         elif csv_pricing == self.__default_csv_reader.klass and self.__exchange_csv_reader.get(self.__default_csv_reader.name) is not None:
             csv_reader = self.__exchange_csv_reader.get(self.__default_csv_reader.name)
         elif csv_pricing is not None:
-            csv_reader = csv_pricing(self._manifest)
+            csv_reader = csv_pricing(self._manifest, False, self.__kraken_csv_update_file)
 
             if csv_pricing == self.__default_csv_reader.klass:
                 self.__exchange_csv_reader[self.__default_csv_reader.name] = csv_reader

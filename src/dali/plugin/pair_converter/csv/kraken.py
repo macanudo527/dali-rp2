@@ -160,13 +160,18 @@ class Kraken:
 
     __DELIMITER: str = ","
 
-    def __init__(self, transaction_manifest: TransactionManifest, force_download: bool = False) -> None:
+    def __init__(self, transaction_manifest: TransactionManifest, force_download: bool = False, update_file: str = None) -> None:
         self.__logger: logging.Logger = create_logger(self.__KRAKEN_OHLCVT)
         self.__session: Session = requests.Session()
         self.__cached_pairs: Dict[str, _PairStartEnd] = {}
         self.__cache_loaded: bool = False
         self.__force_download: bool = force_download
         self.__unchunked_assets: Set[str] = transaction_manifest.assets
+
+        if update_file is not None and path.exists(update_file):
+            self.__logger.info("Combining the unified CSV file with the update file. This may take a few minutes.")
+            self.__logger.info("After the process is complete the update file will be deleted.")
+            self.combine_zip_files(self.__UNIFIED_CSV_FILE, update_file, self.__UNIFIED_CSV_FILE)
 
         self.__logger.debug("Assets: %s", self.__unchunked_assets)
 
@@ -509,6 +514,36 @@ class Kraken:
             self._remove_unified_csv_file()
 
         return True
+
+    # This function is used to combine two zip files into a new zip file.
+    # This is sometimes necessary when quarterly updates are released by Kraken, but
+    # the unified CSV file is not updated yet.
+    def combine_zip_files(zip_file1, zip_file2, output_zip_file):
+        csv_files = {}
+
+        # Read the first zip file
+        with ZipFile(zip_file1, 'r') as zip_ref1:
+            for file_name in zip_ref1.namelist():
+                if file_name.endswith('.csv'):
+                    csv_files[file_name] = zip_ref1.read(file_name).decode(encoding="utf-8")
+
+        # Read the second zip file and append data to existing csv files or add new csv files
+        with ZipFile(zip_file2, 'r') as zip_ref2:
+            for file_name in zip_ref2.namelist():
+                if file_name.endswith('.csv'):
+                    csv_data = zip_ref2.read(file_name).decode(encoding="utf-8")
+                    if file_name in csv_files:
+                        csv_files[file_name] += '\n' + csv_data
+                    else:
+                        csv_files[file_name] = csv_data
+
+        # Write the combined csv files to a new zip file
+        with ZipFile(output_zip_file, 'w', zipfile.ZIP_DEFLATED) as zip_out:
+            for file_name, data in csv_files.items():
+                zip_out.writestr(file_name, data)
+
+        # Remove update file so that the process isn't repeated
+        remove(zip_file2)
 
     def _prompt_download_confirmation(self) -> bool:
         self.__logger.info("\nIn order to provide accurate pricing from Kraken, a large (4.1+ gb) zipfile needs to be downloaded.")
