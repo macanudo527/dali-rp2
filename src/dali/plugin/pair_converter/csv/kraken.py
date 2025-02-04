@@ -31,7 +31,7 @@ from json import JSONDecodeError
 from multiprocessing.pool import ThreadPool
 from os import makedirs, path, remove
 from typing import Dict, Generator, List, NamedTuple, Optional, Set, Tuple, cast
-from zipfile import BadZipFile, ZipFile, is_zipfile
+from zipfile import BadZipFile, ZipFile, is_zipfile, ZIP_DEFLATED
 
 import requests
 from progressbar import ProgressBar, UnknownLength
@@ -167,6 +167,10 @@ class Kraken:
         self.__cache_loaded: bool = False
         self.__force_download: bool = force_download
         self.__unchunked_assets: Set[str] = transaction_manifest.assets
+
+        self.__logger.info("Path to update file: %s", update_file)
+        if path.exists(update_file):
+            self.__logger.info("Update file found. Combining the unified CSV file with the update file.")
 
         if update_file is not None and path.exists(update_file):
             self.__logger.info("Combining the unified CSV file with the update file. This may take a few minutes.")
@@ -518,7 +522,7 @@ class Kraken:
     # This function is used to combine two zip files into a new zip file.
     # This is sometimes necessary when quarterly updates are released by Kraken, but
     # the unified CSV file is not updated yet.
-    def combine_zip_files(zip_file1, zip_file2, output_zip_file):
+    def combine_zip_files(self, zip_file1, zip_file2, output_zip_file):
         csv_files = {}
 
         # Read the first zip file
@@ -533,12 +537,12 @@ class Kraken:
                 if file_name.endswith('.csv'):
                     csv_data = zip_ref2.read(file_name).decode(encoding="utf-8")
                     if file_name in csv_files:
-                        csv_files[file_name] += '\n' + csv_data
+                        csv_files[file_name] += csv_data
                     else:
                         csv_files[file_name] = csv_data
 
         # Write the combined csv files to a new zip file
-        with ZipFile(output_zip_file, 'w', zipfile.ZIP_DEFLATED) as zip_out:
+        with ZipFile(output_zip_file, 'w', ZIP_DEFLATED) as zip_out:
             for file_name, data in csv_files.items():
                 zip_out.writestr(file_name, data)
 

@@ -292,6 +292,8 @@ class AbstractCcxtPairConverterPlugin(AbstractPairConverterPlugin):
         self.__csv_pricing_dict: Dict[str, Any] = _CSV_PRICING_DICT
         self.__default_csv_reader: ExchangeNameAndClass = ExchangeNameAndClass(_KRAKEN, _CSV_PRICING_DICT[_KRAKEN])
         self.__exchange_csv_reader: Dict[str, Any] = {}
+        self._logger.info("Untradeable assets: %s", untradeable_assets)
+        self._logger.info("Kraken update file: %s", kraken_csv_update_file)
         self.__kraken_csv_update_file: Optional[str] = kraken_csv_update_file
 
         # key: name of exchange, value: AVLTree of all snapshots of the graph
