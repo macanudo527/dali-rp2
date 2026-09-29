@@ -550,7 +550,7 @@ class AbstractCcxtPairConverterPlugin(AbstractPairConverterPlugin):
         elif csv_pricing == self.__default_csv_reader.klass and self.__exchange_csv_reader.get(self.__default_csv_reader.name) is not None:
             csv_reader = self.__exchange_csv_reader.get(self.__default_csv_reader.name)
         elif csv_pricing is not None:
-            csv_reader = csv_pricing(self._manifest, False, self.__kraken_csv_update_file)
+            csv_reader = csv_pricing(self._manifest, update_file=self.__kraken_csv_update_file)
 
             if csv_pricing == self.__default_csv_reader.klass:
                 self.__exchange_csv_reader[self.__default_csv_reader.name] = csv_reader

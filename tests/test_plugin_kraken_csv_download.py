@@ -14,15 +14,18 @@
 
 # pylint: disable=protected-access
 
+import json
 import tracemalloc
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 from os import listdir, makedirs, path, remove, unlink
 from pathlib import Path
 from shutil import copyfile
-from typing import Any, Dict, List, Optional
-from zipfile import ZIP_DEFLATED, ZipFile
+from typing import Any, Dict, List, Optional, Tuple
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 import pytest
+import requests
 from pytest_mock import MockerFixture
 from rp2.rp2_decimal import RP2Decimal
 from rp2.rp2_error import RP2RuntimeError
@@ -49,6 +52,16 @@ _NEW_PAIR_ROW: str = f"{_UPDATE_TIMESTAMP},13500.1,13500.2,13500.0,13500.1,1.5,3
 # Finer timeframes cover a shorter history to keep the files small, and there were no XBTUSD trades at 2021-01-01 00:03.
 _UNIFIED_FIXTURE: str = "input/Kraken_OHLCVT_unified_test.zip"
 _UPDATE_FIXTURE: str = "input/Kraken_OHLCVT_update_test.zip"
+
+# Kraken publishes its complete OHLCVT history as one zip file split into parts, which are listed in a checksum file
+_KRAKEN_ASSETS_URL: str = "https://assets.kraken.com/marketing/institutions/"
+_KRAKEN_CHECKSUMS_URL: str = _KRAKEN_ASSETS_URL + "OHLCVT_Full_PARTS_SHA256SUMS.txt"
+# Kraken's public endpoint for the trades after a point in time
+_KRAKEN_TRADES_URL: str = "https://api.kraken.com/0/public/Trades"
+# 2021-01-01 00:00 UTC, right after the end of _UNIFIED_FIXTURE
+_JANUARY_1: int = 1609459200
+# Timeframes (in minutes) the plugin prices from
+_PRICED_TIMEFRAMES: List[int] = [1, 5, 15, 60, 720, 1440]
 
 # Fake Transaction
 FAKE_TRANSACTION: InTransaction = InTransaction(
@@ -86,6 +99,129 @@ def _read_zip(zip_path: Path) -> Dict[str, str]:
         return {file_name: zip_file.read(file_name).decode(encoding="utf-8") for file_name in zip_file.namelist()}
 
 
+# Byte range [start, end) of each file's local header and data inside a zip file
+def _file_spans(zip_path: str) -> Dict[str, Tuple[int, int]]:
+    with ZipFile(zip_path) as zip_file:
+        infos: List[ZipInfo] = sorted(zip_file.infolist(), key=lambda info: info.header_offset)
+        ends: List[int] = [info.header_offset for info in infos[1:]] + [zip_file.start_dir]
+    return {info.filename: (info.header_offset, end) for info, end in zip(infos, ends)}
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, content: bytes = b"", headers: Optional[Dict[str, str]] = None) -> None:
+        self.status_code: int = status_code
+        self.content: bytes = content
+        self.headers: Dict[str, str] = headers if headers is not None else {}
+
+    @property
+    def text(self) -> str:
+        return self.content.decode(encoding="utf-8")
+
+    def json(self) -> Any:
+        return json.loads(self.content)
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}")
+
+
+# Stands in for Kraken's servers: serves zip files split into parts plus the checksum list of the latest one, and trades
+# like Kraken's public Trades endpoint. Records every request and every byte range that is downloaded.
+class _FakeKrakenServer:
+    def __init__(self, part_size: int = 1000) -> None:
+        self.requests: List[str] = []
+        self.downloaded: List[Tuple[int, int]] = []  # [start, end) offsets inside the joined zip file
+        self.unreachable: bool = False
+        self.trades_unreachable: bool = False
+        self.rate_limited_trade_requests: int = 0  # How many of the next Trades requests get Kraken's rate limit error
+        self.__part_size: int = part_size
+        self.__parts: Dict[str, bytearray] = {}
+        self.__part_offsets: Dict[str, int] = {}
+        self.__latest_parts: List[str] = []
+        self.__checksums: str = ""
+        self.__trades: Dict[str, List[Tuple[int, str, str]]] = {}  # Pair -> (time in nanoseconds, price, volume)
+
+    # Trades of a pair, as (time in seconds, price, volume)
+    def add_trades(self, pair: str, trades: List[Tuple[float, str, str]]) -> None:
+        self.__trades.setdefault(pair, []).extend((round(time * 1_000_000_000), price, volume) for time, price, volume in trades)
+        self.__trades[pair].sort()
+
+    def publish(self, release: str, zip_path: str) -> None:
+        data: bytes = Path(zip_path).read_bytes()
+        self.__latest_parts = []
+        for number, start in enumerate(range(0, len(data), self.__part_size)):
+            url: str = f"{_KRAKEN_ASSETS_URL}{release}.zip.part{number:02d}"
+            self.__parts[url] = bytearray(data[start : start + self.__part_size])
+            self.__part_offsets[url] = start
+            self.__latest_parts.append(url)
+        self.__checksums = "".join(f"{sha256(self.__parts[url]).hexdigest()}  {url.rsplit('/', 1)[1]}\n" for url in self.__latest_parts)
+
+    # Flips a byte of the latest release, as if it got corrupted on the way
+    def corrupt(self, offset: int) -> None:
+        for url in self.__latest_parts:
+            if self.__part_offsets[url] <= offset < self.__part_offsets[url] + len(self.__parts[url]):
+                self.__parts[url][offset - self.__part_offsets[url]] ^= 0xFF
+
+    def head(self, url: str, **_kwargs: Any) -> _FakeResponse:
+        self.__request(url)
+        if url not in self.__parts:
+            return _FakeResponse(404)
+        return _FakeResponse(200, headers={"Content-Length": str(len(self.__parts[url]))})
+
+    def get(self, url: str, headers: Optional[Dict[str, str]] = None, params: Optional[Dict[str, Any]] = None, **_kwargs: Any) -> _FakeResponse:
+        self.__request(url)
+        if url == _KRAKEN_TRADES_URL:
+            return self.__serve_trades(params or {})
+        if url == _KRAKEN_CHECKSUMS_URL:
+            return _FakeResponse(200, self.__checksums.encode(encoding="utf-8"))
+        if url not in self.__parts:
+            return _FakeResponse(404)
+        part: bytearray = self.__parts[url]
+        first, last = (int(value) for value in (headers or {})["Range"].removeprefix("bytes=").split("-"))
+        body: bytes = bytes(part[first : last + 1])
+        self.downloaded.append((self.__part_offsets[url] + first, self.__part_offsets[url] + first + len(body)))
+        return _FakeResponse(206, body, {"Content-Range": f"bytes {first}-{first + len(body) - 1}/{len(part)}"})
+
+    def is_downloaded(self, span: Tuple[int, int]) -> bool:
+        return any(first < span[1] and span[0] < last for first, last in self.downloaded)
+
+    # Like Kraken, "since" is a time in seconds or the nanosecond cursor returned as "last", and at most 1000 trades are returned
+    def __serve_trades(self, params: Dict[str, Any]) -> _FakeResponse:
+        if self.trades_unreachable:
+            raise requests.ConnectionError(f"Can't reach {_KRAKEN_TRADES_URL}")
+        if self.rate_limited_trade_requests > 0:
+            self.rate_limited_trade_requests -= 1
+            return self.__json({"error": ["EGeneral:Too many requests"]})
+        if params["pair"] not in self.__trades:
+            return self.__json({"error": ["EQuery:Unknown asset pair"]})
+        since: int = int(params["since"])
+        trades: List[Tuple[int, str, str]] = self.__trades[params["pair"]]
+        # A time in seconds includes the trades from that second on, a cursor only the trades after it
+        first_included: int = since * 1_000_000_000 if since < 10**12 else since + 1
+        newer: List[Tuple[int, str, str]] = [trade for trade in trades if trade[0] >= first_included]
+        page: List[Tuple[int, str, str]] = newer[: min(int(params.get("count", 1000)), 1000)]
+        rows: List[List[Any]] = [[price, volume, time / 1_000_000_000, "b", "l", "", number] for number, (time, price, volume) in enumerate(page)]
+        return self.__json({"error": [], "result": {f"X{params['pair']}": rows, "last": str(page[-1][0] if page else since)}})
+
+    @staticmethod
+    def __json(body: Dict[str, Any]) -> _FakeResponse:
+        return _FakeResponse(200, json.dumps(body).encode(encoding="utf-8"))
+
+    def __request(self, url: str) -> None:
+        if self.unreachable:
+            raise requests.ConnectionError(f"Can't reach {url}")
+        self.requests.append(url)
+
+
+# Fails any test that would reach the real Kraken server
+class _NoNetwork:
+    def head(self, url: str, **_kwargs: Any) -> None:
+        raise AssertionError(f"Unexpected network access to {url}")
+
+    def get(self, url: str, **_kwargs: Any) -> None:
+        raise AssertionError(f"Unexpected network access to {url}")
+
+
 @pytest.fixture(name="unified_csv_file")
 def unified_csv_file_fixture(tmp_path: Path, mocker: MockerFixture) -> Path:
     # Point every file the plugin touches into tmp_path, so tests never read or clobber a real download or cache.
@@ -99,11 +235,29 @@ def unified_csv_file_fixture(tmp_path: Path, mocker: MockerFixture) -> Path:
     mocker.patch.object(Kraken, "_Kraken__CSV_DIRECTORY", f"{csv_directory}/")
     mocker.patch.object(Kraken, "_Kraken__UNIFIED_CSV_FILE", str(unified_csv_file))
 
-    # Never block on input(). Declining the download is the default.
-    mocker.patch.object(Kraken, "_prompt_download_confirmation", return_value=False)
+    # Never block on input() or reach the real Kraken server
     mocker.patch.object(Kraken, "_prompt_delete_confirmation", return_value=False)
+    mocker.patch("dali.plugin.pair_converter.csv.kraken.Session", return_value=_NoNetwork())
 
     return unified_csv_file
+
+
+@pytest.fixture(name="kraken_server")
+def kraken_server_fixture(unified_csv_file: Path, mocker: MockerFixture) -> _FakeKrakenServer:
+    # Starts without a local unified file, so prices come from Kraken's server
+    assert not unified_csv_file.exists()
+    server: _FakeKrakenServer = _FakeKrakenServer()
+    mocker.patch("dali.plugin.pair_converter.csv.kraken.Session", return_value=server)
+    return server
+
+
+@pytest.fixture(name="kraken_trades")
+def kraken_trades_fixture(kraken_server: _FakeKrakenServer, mocker: MockerFixture) -> _FakeKrakenServer:
+    # The release ends with 2020, so later times can only be priced from Kraken's trades
+    kraken_server.publish("Kraken_OHLCVT_Full_2020Q4", _UNIFIED_FIXTURE)
+    # Don't wait between requests the way Kraken's rate limit requires
+    mocker.patch("dali.plugin.pair_converter.csv.kraken_trades.sleep")
+    return kraken_server
 
 
 @pytest.fixture(name="merged_kraken_csv")
@@ -220,25 +374,12 @@ class TestKrakenCsvUpdateFile:
         update_file: Path = tmp_path / "update.zip"
         _write_zip(update_file, {"USDTUSD_1.csv": _UPDATE_ROW})
 
-        # The user declines to download the unified file (fixture default), so there is nothing to merge into
+        # Update files are only merged into a local unified file. Without one, prices come from Kraken's latest release.
         Kraken(transaction_manifest=_manifest(), update_file=str(update_file))
 
-        # Keep the update file so it can be merged on a later run
+        # Keep the update file in case a local unified file is added later, and don't create one
         assert update_file.exists()
         assert not unified_csv_file.exists()
-
-    def test_unified_file_is_downloaded_before_merging_update_file(self, unified_csv_file: Path, tmp_path: Path, mocker: MockerFixture) -> None:
-        update_file: Path = tmp_path / "update.zip"
-        _write_zip(update_file, {"USDTUSD_1.csv": _UPDATE_ROW})
-        mocker.patch.object(Kraken, "_prompt_download_confirmation", return_value=True)
-        # Like the real download, this fails if the CSV directory hasn't been created yet
-        download = mocker.patch.object(Kraken, "_Kraken__download_unified_csv", side_effect=lambda: copyfile(_UNIFIED_TEST_FILE, unified_csv_file))
-
-        Kraken(transaction_manifest=_manifest(), update_file=str(update_file))
-
-        download.assert_called_once()
-        assert _read_zip(unified_csv_file)["USDTUSD_1.csv"].endswith(_LAST_UNIFIED_ROW + _UPDATE_ROW)
-        assert not update_file.exists()
 
     def test_failed_merge_leaves_unified_file_intact(self, unified_csv_file: Path, tmp_path: Path, mocker: MockerFixture) -> None:
         unified_csv_file.parent.mkdir(parents=True)
@@ -382,3 +523,195 @@ class TestKrakenCsvUpdateFileFixtures:
         assert test_bars[0].timestamp == datetime(2020, 12, 28, tzinfo=timezone.utc)
         # Sum of the daily volumes of 2020-12-28 to 2020-12-31 from the unified file and 2021-01-01 to 2021-01-03 from the update file
         assert test_bars[0].volume == RP2Decimal("32822.59186282")
+
+
+class TestKrakenCsvRemoteRelease:
+    def test_prices_are_read_from_kraken_by_downloading_only_the_priced_pair(self, kraken_server: _FakeKrakenServer, unified_csv_file: Path) -> None:
+        kraken_server.publish("Kraken_OHLCVT_Full_2021Q1", _UPDATE_FIXTURE)
+
+        test_bar: Optional[HistoricalBar] = Kraken(transaction_manifest=_manifest()).find_historical_bar(
+            "BTC", "USD", datetime(2021, 1, 1, 0, 0, tzinfo=timezone.utc)
+        )
+
+        assert test_bar
+        assert test_bar.duration == timedelta(minutes=1)
+        assert test_bar.close == RP2Decimal("28986.5")
+        # Only the XBTUSD CSVs the plugin prices from were downloaded (not MATICUSD, nor the 30 and 240 minute ones)
+        priced_files: List[str] = [f"XBTUSD_{minutes}.csv" for minutes in _PRICED_TIMEFRAMES]
+        for file_name, span in _file_spans(_UPDATE_FIXTURE).items():
+            assert kraken_server.is_downloaded(span) == (file_name in priced_files), file_name
+        # The release isn't saved as a local unified file
+        assert not unified_csv_file.exists()
+
+    def test_route_selection_downloads_only_daily_candles(self, kraken_server: _FakeKrakenServer) -> None:
+        kraken_server.publish("Kraken_OHLCVT_Full_2021Q1", _UPDATE_FIXTURE)
+
+        test_bars: Optional[List[HistoricalBar]] = Kraken(transaction_manifest=_manifest()).find_historical_bars(
+            "BTC", "USD", datetime(2021, 1, 4, tzinfo=timezone.utc), True, "1w"
+        )
+
+        # Weekly candles are emulated from daily candles, which is all that picking routes needs
+        assert test_bars
+        assert test_bars[0].timestamp == datetime(2021, 1, 4, tzinfo=timezone.utc)
+        for file_name, span in _file_spans(_UPDATE_FIXTURE).items():
+            assert kraken_server.is_downloaded(span) == (file_name == "XBTUSD_1440.csv"), file_name
+
+    def test_pairs_are_downloaded_once_per_release(self, kraken_server: _FakeKrakenServer) -> None:
+        kraken_server.publish("Kraken_OHLCVT_Full_2021Q1", _UPDATE_FIXTURE)
+        assert Kraken(transaction_manifest=_manifest()).find_historical_bar("BTC", "USD", datetime(2021, 1, 1, 0, 0, tzinfo=timezone.utc))
+        kraken_server.requests.clear()
+
+        # The next run prices from the cached candles
+        test_bar: Optional[HistoricalBar] = Kraken(transaction_manifest=_manifest()).find_historical_bar(
+            "BTC", "USD", datetime(2021, 1, 1, 0, 3, tzinfo=timezone.utc)
+        )
+
+        assert test_bar
+        assert test_bar.close == RP2Decimal("28961.9")
+        # Only the checksum list is fetched, to check whether Kraken published a new release
+        assert kraken_server.requests == [_KRAKEN_CHECKSUMS_URL]
+
+    def test_new_release_replaces_pairs_read_from_the_previous_one(self, kraken_server: _FakeKrakenServer) -> None:
+        kraken_server.publish("Kraken_OHLCVT_Full_2020Q4", _UNIFIED_FIXTURE)
+        test_bar: Optional[HistoricalBar] = Kraken(transaction_manifest=_manifest()).find_historical_bar(
+            "BTC", "USD", datetime(2020, 12, 31, 23, 59, tzinfo=timezone.utc)
+        )
+        assert test_bar
+        assert test_bar.close == RP2Decimal("28990.0")
+
+        # Kraken publishes the next quarter, which the XBTUSD candles cached from the previous release don't have
+        kraken_server.publish("Kraken_OHLCVT_Full_2021Q1", _UPDATE_FIXTURE)
+        test_bar = Kraken(transaction_manifest=_manifest()).find_historical_bar("BTC", "USD", datetime(2021, 1, 1, 0, 0, tzinfo=timezone.utc))
+
+        assert test_bar
+        assert test_bar.duration == timedelta(minutes=1)
+        assert test_bar.close == RP2Decimal("28986.5")
+
+    def test_local_unified_file_is_used_without_contacting_kraken(self, kraken_server: _FakeKrakenServer, unified_csv_file: Path) -> None:
+        kraken_server.publish("Kraken_OHLCVT_Full_2021Q1", _UPDATE_FIXTURE)
+        unified_csv_file.parent.mkdir(parents=True)
+        copyfile(_UNIFIED_FIXTURE, unified_csv_file)
+
+        test_bar: Optional[HistoricalBar] = Kraken(transaction_manifest=_manifest()).find_historical_bar(
+            "BTC", "USD", datetime(2020, 12, 31, 23, 59, tzinfo=timezone.utc)
+        )
+
+        assert test_bar
+        assert test_bar.close == RP2Decimal("28990.0")
+        assert not kraken_server.requests
+
+    def test_unreachable_kraken_stops_with_an_error(self, kraken_server: _FakeKrakenServer) -> None:
+        kraken_server.publish("Kraken_OHLCVT_Full_2021Q1", _UPDATE_FIXTURE)
+        kraken_server.unreachable = True
+
+        # Kraken's REST API isn't accurate enough to fall back to, so DaLI stops rather than use a worse price
+        with pytest.raises(RP2RuntimeError, match="Kraken"):
+            Kraken(transaction_manifest=_manifest()).find_historical_bar("BTC", "USD", datetime(2021, 1, 1, 0, 0, tzinfo=timezone.utc))
+
+    def test_corrupted_download_stops_with_an_error(self, kraken_server: _FakeKrakenServer) -> None:
+        kraken_server.publish("Kraken_OHLCVT_Full_2021Q1", _UPDATE_FIXTURE)
+        start, _ = _file_spans(_UPDATE_FIXTURE)["XBTUSD_1.csv"]
+        kraken_server.corrupt(start + 100)  # Past the local file header, inside the compressed data
+
+        # Every CSV's CRC-32 is checked, so a bad download can't turn into a wrong price
+        with pytest.raises(RP2RuntimeError, match="Kraken"):
+            Kraken(transaction_manifest=_manifest()).find_historical_bar("BTC", "USD", datetime(2021, 1, 1, 0, 0, tzinfo=timezone.utc))
+
+
+class TestKrakenTrades:
+    def test_times_after_the_release_are_priced_from_kraken_trades(self, kraken_trades: _FakeKrakenServer) -> None:
+        kraken_trades.add_trades(
+            "XBTUSD",
+            [
+                (_JANUARY_1 + 5, "29000.0", "0.5"),
+                (_JANUARY_1 + 20, "29010.5", "0.25"),
+                (_JANUARY_1 + 55, "29005.2", "1.0"),
+                (_JANUARY_1 + 65, "29100.0", "0.1"),
+            ],
+        )
+
+        test_bar: Optional[HistoricalBar] = Kraken(transaction_manifest=_manifest()).find_historical_bar(
+            "BTC", "USD", datetime.fromtimestamp(_JANUARY_1 + 30, timezone.utc)
+        )
+
+        # The candle of the trades in that minute. The last trade is in the next minute.
+        assert test_bar == HistoricalBar(
+            duration=timedelta(minutes=1),
+            timestamp=datetime.fromtimestamp(_JANUARY_1, timezone.utc),
+            open=RP2Decimal("29000.0"),
+            high=RP2Decimal("29010.5"),
+            low=RP2Decimal("29000.0"),
+            close=RP2Decimal("29005.2"),
+            volume=RP2Decimal("1.75"),
+        )
+
+    def test_minute_without_trades_uses_the_next_timeframe_with_trades(self, kraken_trades: _FakeKrakenServer) -> None:
+        kraken_trades.add_trades("XBTUSD", [(_JANUARY_1 + 125, "29050.0", "0.3")])
+
+        test_bar: Optional[HistoricalBar] = Kraken(transaction_manifest=_manifest()).find_historical_bar(
+            "BTC", "USD", datetime.fromtimestamp(_JANUARY_1 + 190, timezone.utc)
+        )
+
+        # There were no trades at 00:03, so like with the CSV candles the 5 minute candle is used
+        assert test_bar
+        assert test_bar.duration == timedelta(minutes=5)
+        assert test_bar.timestamp == datetime.fromtimestamp(_JANUARY_1, timezone.utc)
+        assert test_bar.close == RP2Decimal("29050.0")
+
+    def test_busy_minutes_are_read_across_several_requests(self, kraken_trades: _FakeKrakenServer) -> None:
+        # 2,500 trades in one minute, while Kraken returns at most 1,000 per request
+        kraken_trades.add_trades("XBTUSD", [(_JANUARY_1 + number * 0.02, f"{29000 + number / 100:.2f}", "0.001") for number in range(2500)])
+        kraken_trades.add_trades("XBTUSD", [(_JANUARY_1 + 61, "1.0", "1.0")])
+
+        test_bar: Optional[HistoricalBar] = Kraken(transaction_manifest=_manifest()).find_historical_bar(
+            "BTC", "USD", datetime.fromtimestamp(_JANUARY_1 + 10, timezone.utc)
+        )
+
+        assert test_bar
+        assert test_bar.close == RP2Decimal("29024.99")
+        assert test_bar.high == RP2Decimal("29024.99")
+        assert test_bar.volume == RP2Decimal("2.5")
+
+    def test_pair_listed_after_the_release_is_priced_from_trades(self, kraken_trades: _FakeKrakenServer) -> None:
+        kraken_trades.add_trades("SOLUSD", [(_JANUARY_1 + 10, "1.52", "40")])
+
+        test_bar: Optional[HistoricalBar] = Kraken(transaction_manifest=_manifest()).find_historical_bar(
+            "SOL", "USD", datetime.fromtimestamp(_JANUARY_1, timezone.utc)
+        )
+
+        assert test_bar
+        assert test_bar.close == RP2Decimal("1.52")
+
+    def test_times_covered_by_the_release_are_not_priced_from_trades(self, kraken_trades: _FakeKrakenServer) -> None:
+        # A made-up trade in the release's last minute, which must not be used
+        kraken_trades.add_trades("XBTUSD", [(_JANUARY_1 - 30, "1.0", "1.0")])
+
+        test_bar: Optional[HistoricalBar] = Kraken(transaction_manifest=_manifest()).find_historical_bar(
+            "BTC", "USD", datetime(2020, 12, 31, 23, 59, tzinfo=timezone.utc)
+        )
+
+        assert test_bar
+        assert test_bar.close == RP2Decimal("28990.0")
+        assert _KRAKEN_TRADES_URL not in kraken_trades.requests
+
+    def test_pair_kraken_does_not_trade_has_no_price(self, kraken_trades: _FakeKrakenServer) -> None:
+        # Neither in the release nor known to Kraken's Trades endpoint: nothing to price from, which isn't an error
+        assert Kraken(transaction_manifest=_manifest()).find_historical_bar("DOGE", "USD", datetime.fromtimestamp(_JANUARY_1, timezone.utc)) is None
+        assert _KRAKEN_TRADES_URL in kraken_trades.requests
+
+    def test_rate_limited_requests_are_retried(self, kraken_trades: _FakeKrakenServer) -> None:
+        kraken_trades.add_trades("XBTUSD", [(_JANUARY_1 + 5, "29000.0", "0.5")])
+        kraken_trades.rate_limited_trade_requests = 2
+
+        test_bar: Optional[HistoricalBar] = Kraken(transaction_manifest=_manifest()).find_historical_bar(
+            "BTC", "USD", datetime.fromtimestamp(_JANUARY_1, timezone.utc)
+        )
+
+        assert test_bar
+        assert test_bar.close == RP2Decimal("29000.0")
+
+    def test_unreachable_trades_endpoint_stops_with_an_error(self, kraken_trades: _FakeKrakenServer) -> None:
+        kraken_trades.trades_unreachable = True
+
+        with pytest.raises(RP2RuntimeError, match="Kraken"):
+            Kraken(transaction_manifest=_manifest()).find_historical_bar("BTC", "USD", datetime.fromtimestamp(_JANUARY_1, timezone.utc))

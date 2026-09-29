@@ -12,30 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This plugin facilitates the downloading of the unified CSV located at
-# https://drive.google.com/file/d/1ptNqWYidLkhb2VAKuLCxmp2OXEfGO-AP/view?usp=sharing
-# This link will have to be updated quarterly when Kraken releases a new file.
-# Note that you can manually download the unified file as Kraken_OHLCVT.zip
-# to the .dali_cache/kraken/csv/ and dali-rp2 will use that file.
-# For more information on this file visit the following link:
+# This plugin prices from the OHLCVT data Kraken publishes every quarter:
 # https://support.kraken.com/hc/en-us/articles/360047124832-Downloadable-historical-OHLCVT-Open-High-Low-Close-Volume-Trades-data
+# Only the CSVs of the pairs being priced are downloaded from Kraken's latest complete release (see kraken_release.py).
+# If the whole release is downloaded, joined into Kraken_OHLCVT.zip and put in .dali_cache/kraken/csv/, dali-rp2 uses that file instead.
 
 # Kraken CSV format: (epoch) timestamp, open, high, low, close, volume, trades
 
 import logging
-import re
+import zlib
 from csv import reader, writer
 from datetime import datetime, timedelta, timezone
 from gzip import open as gopen
-from json import JSONDecodeError
 from multiprocessing.pool import ThreadPool
 from os import makedirs, path, remove, replace
 from typing import IO, Dict, Generator, List, NamedTuple, Optional, Set, Tuple, cast
-from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile, is_zipfile
+from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 
-import requests
-from progressbar import ProgressBar, UnknownLength
-from progressbar.widgets import AdaptiveTransferSpeed, BouncingBar, DataSize
+from requests import RequestException
 from requests.sessions import Session
 from rp2.logger import create_logger
 from rp2.rp2_decimal import ZERO, RP2Decimal
@@ -43,36 +37,9 @@ from rp2.rp2_error import RP2RuntimeError, RP2ValueError
 
 from dali.cache import load_from_cache, save_to_cache
 from dali.historical_bar import HistoricalBar
+from dali.plugin.pair_converter.csv.kraken_release import KrakenRelease
+from dali.plugin.pair_converter.csv.kraken_trades import KrakenTrades
 from dali.transaction_manifest import TransactionManifest
-
-# Google Drive parameters
-_ACCESS_NOT_CONFIGURED: str = "accessNotConfigured"
-_BAD_REQUEST: str = "badRequest"
-_INVALID_VALUE: str = "invalid"
-_ERROR: str = "error"
-_ERRORS: str = "errors"
-_FILES: str = "files"
-
-# The endpoint we will use to query Google Drive for the specific file we need
-# We will also use this to request a file download.
-_GOOGLE_APIS_URL: str = "https://www.googleapis.com/drive/v3/files"
-_ID: str = "id"
-
-# The URL for downloading the actual file from Google Drive with security params
-_GOOGLE_DRIVE_DOWNLOAD_URL: str = "https://drive.usercontent.google.com/download"
-
-# File ID for the unified CSV file ID. This will need to be replaced every quarter.
-# File can also be manually downloaded from https://drive.google.com/file/d/1ptNqWYidLkhb2VAKuLCxmp2OXEfGO-AP/view?usp=sharing
-_UNIFIED_CSV_FILE_ID: str = "1ptNqWYidLkhb2VAKuLCxmp2OXEfGO-AP"
-_MESSAGE: str = "message"
-_REASON: str = "reason"
-
-# Google Drive URL Params
-_ALT: str = "alt"
-_API_KEY: str = "key"
-_CONFIRM: str = "confirm"
-_MEDIA: str = "media"
-_QUERY: str = "q"
 
 # Time periods
 _MS_IN_SECOND: int = 1000
@@ -126,8 +93,14 @@ _PAIR_MIDDLE: str = "middle"
 _PAIR_END: str = "end"
 _MAX_MULTIPLIER: int = 500
 
-# Download and copy chunks
+# Copy chunks
 _CHUNK_SIZE_BYTES: int = 32768  # 32kb
+
+# Where the cached pairs were read from: the local unified CSV file, or else the name of a Kraken release
+_LOCAL_SOURCE: str = "local unified CSV file"
+
+# Kraken's REST API only returns its latest 720 candles, so older prices from it come from coarse candles
+_NO_REST_FALLBACK: str = "Kraken's REST API isn't accurate enough to price from instead, so try again once Kraken can be reached."
 
 DAYS_IN_WEEK: int = 7
 
@@ -167,15 +140,14 @@ def _copy_rows_newer_than(source: IO[bytes], destination: IO[bytes], timestamp: 
 
 class Kraken:
     ISSUES_URL: str = "https://github.com/eprbell/dali-rp2/issues"
-    DEFAULT_TIMEOUT: int = 10
     __KRAKEN_OHLCVT: str = "Kraken.com_CSVOHLCVT"
 
     __CACHE_DIRECTORY: str = ".dali_cache/kraken/"
     __CSV_DIRECTORY: str = ".dali_cache/kraken/csv/"
     __UNIFIED_CSV_FILE: str = __CSV_DIRECTORY + "Kraken_OHLCVT.zip"
     __CACHE_KEY: str = "Kraken-csv-download"
+    __SOURCE_CACHE_KEY: str = "Kraken-csv-source"
 
-    __TIMEOUT: int = 30
     __THREAD_COUNT: int = 3
 
     __TIMESTAMP_INDEX: int = 0
@@ -188,12 +160,15 @@ class Kraken:
 
     __DELIMITER: str = ","
 
-    def __init__(self, transaction_manifest: TransactionManifest, force_download: bool = False, update_file: Optional[str] = None) -> None:
+    def __init__(self, transaction_manifest: TransactionManifest, update_file: Optional[str] = None) -> None:
         self.__logger: logging.Logger = create_logger(self.__KRAKEN_OHLCVT)
-        self.__session: Session = requests.Session()
+        self.__session: Session = Session()
         self.__cached_pairs: Dict[str, _PairStartEnd] = {}
         self.__cache_loaded: bool = False
-        self.__force_download: bool = force_download
+        # Kraken's latest release, used when there is no local unified CSV file. None until needed.
+        self.__release: Optional[KrakenRelease] = None
+        # Prices times newer than Kraken's CSV data, e.g. in the current quarter
+        self.__trades: KrakenTrades = KrakenTrades(self.__session)
         self.__unchunked_assets: Set[str] = transaction_manifest.assets
 
         self.__logger.debug("Assets: %s", self.__unchunked_assets)
@@ -214,6 +189,30 @@ class Kraken:
     def __load_cache(self) -> None:
         result = cast(Dict[str, _PairStartEnd], load_from_cache(self.cache_key()))
         self.__cached_pairs = result if result is not None else {}
+        if path.exists(self.__UNIFIED_CSV_FILE):
+            return
+
+        # Without a local unified CSV file, pairs are read from Kraken's latest release. Once Kraken publishes a new
+        # release, the pairs read from the previous one are missing its data, so they are read again as they are needed.
+        try:
+            release: KrakenRelease = self.__get_release()
+        except RP2RuntimeError as exc:
+            # The cached pairs are still accurate, so they can be used. Anything else that needs Kraken's server fails later.
+            self.__logger.warning("%s Using the cached Kraken data meanwhile.", exc)
+            return
+        if load_from_cache(self.__SOURCE_CACHE_KEY) != release.name:
+            if self.__cached_pairs:
+                self.__logger.info("Kraken published %s. Cached pairs will be downloaded again from it as they are needed.", release.name)
+            self.__cached_pairs = {}
+            save_to_cache(self.cache_key(), self.__cached_pairs)
+
+    def __get_release(self) -> KrakenRelease:
+        if self.__release is None:
+            try:
+                self.__release = KrakenRelease(self.__session)
+            except (RequestException, RP2RuntimeError) as exc:
+                raise RP2RuntimeError(f"Couldn't reach Kraken's server for its OHLCVT data ({exc}). {_NO_REST_FALLBACK}") from exc
+        return self.__release
 
     def __split_process(self, csv_file: str, chunk_size: int = _CHUNK_SIZE) -> Generator[Tuple[str, List[List[str]]], None, None]:
         chunk: List[List[str]] = []
@@ -236,65 +235,6 @@ class Kraken:
         if chunk:
             position = _PAIR_END
             yield position, chunk
-
-    def __download_unified_csv(self) -> None:
-        try:
-            retry_count = 0
-            while True:
-                # Downloading the unified zipfile that contains all the trading pairs
-                response = self.__session.get("https://docs.google.com/uc?export=download&confirm=1", params={"id": _UNIFIED_CSV_FILE_ID}, stream=True)
-
-                # Use response.text instead of response.content since an html form will be returned that we need to grab strings from.
-                html_content = response.text
-
-                # The unified file is large (3.9gig+), so Google Drive will warn us that it can not automatically scan it for viruses.
-                # Embedded in this warning is a hidden form with an id, export, confirm, and uuid tokens to submit in order to override the warning.
-                # First we harvest the tokens.
-                if "Google Drive - Virus scan warning" in html_content:
-                    # Extract the required parameters using regular expressions
-                    id_match = re.search(r'name="id"\s+value="([^"]+)"', html_content)
-                    export_match = re.search(r'name="export"\s+value="([^"]+)"', html_content)
-                    confirm_match = re.search(r'name="confirm"\s+value="([^"]+)"', html_content)
-                    uuid_match = re.search(r'name="uuid"\s+value="([^"]+)"', html_content)
-
-                    # Confirm they exist. This is a sanity check to verify the process has remained the same.
-                    if id_match and export_match and confirm_match and uuid_match:
-                        file_id = id_match.group(1)
-                        export = export_match.group(1)
-                        confirm = confirm_match.group(1)
-                        uuid = uuid_match.group(1)
-                    else:
-                        raise ValueError("Failed to extract parameters from HTML")
-
-                    # Set up the parameters for the download
-                    params = {"id": file_id, "export": export, "confirm": confirm, "uuid": uuid}
-                    query_string = "&".join(f"{key}={value}" for key, value in params.items())
-
-                    # Make the request and download the file using the params harvested earlier
-                    response = requests.get(_GOOGLE_DRIVE_DOWNLOAD_URL, params=params, stream=True, timeout=self.DEFAULT_TIMEOUT)
-                    self.__logger.info("Downloading the unified CSV from %s?%s", _GOOGLE_DRIVE_DOWNLOAD_URL, query_string)
-
-                with open(self.__UNIFIED_CSV_FILE, "wb") as file, ProgressBar(
-                    max_value=UnknownLength, widgets=["Downloading: ", BouncingBar(), " ", DataSize(), " ", AdaptiveTransferSpeed()]
-                ) as progress_bar:
-                    progress_bar.start()
-                    for chunk in response.iter_content(_CHUNK_SIZE_BYTES):
-                        if chunk:  # Filter out keep-alive new chunks
-                            file.write(chunk)
-                            progress_bar.update(progress_bar.value + len(chunk))
-                    progress_bar.finish()
-
-                if is_zipfile(self.__UNIFIED_CSV_FILE):
-                    break
-                retry_count += 1
-                if retry_count > 2:
-                    raise RP2RuntimeError("Invalid zipfile. Giving up. Try again later.")
-                self._remove_unified_csv_file()
-                self.__logger.info("Downloaded file is invalid, trying to download again.")
-
-        except JSONDecodeError as exc:
-            self.__logger.debug("Fetching of kraken csv files failed. Try again later.")
-            raise RP2RuntimeError("JSON decode error") from exc
 
     def _split_chunks_size_n(self, file_name: str, csv_file: str, chunk_size: int = _CHUNK_SIZE) -> None:
         pair, duration_in_minutes = file_name.strip(".csv").split("_", 1)
@@ -483,75 +423,94 @@ class Kraken:
             self.__load_cache()
             self.__cache_loaded = True
 
-        # Attempt to load smallest duration
-        if self.__cached_pairs.get(base_asset + quote_asset + _MINUTE_IN_MINUTES):
-            plural: str = "s" if all_bars else ""
-            self.__logger.debug("Retrieving cached bar%s for %s, %s at %s", plural, base_asset, quote_asset, epoch_timestamp)
-            return self._retrieve_cached_bars(base_asset, quote_asset, epoch_timestamp, all_bars, timespan)
+        # Picking routes only needs weekly candles, so a pair can be cached with those alone (see _unzip_and_chunk)
+        pair: str = base_asset + quote_asset
+        cached_timeframe: str = _ONE_WEEK_IN_MINUTES if all_bars and timespan == _ONE_WEEK_IN_STR else _MINUTE_IN_MINUTES
+        if not self.__cached_pairs.get(pair + cached_timeframe) and not self._unzip_and_chunk(base_asset, quote_asset, all_bars, timespan):
+            # Kraken's CSV data doesn't have the pair, e.g. because it was listed after the latest release
+            return None if all_bars else self.__find_bar_in_trades(pair, epoch_timestamp)
 
-        if self._unzip_and_chunk(base_asset, quote_asset, all_bars):
-            return self._retrieve_cached_bars(base_asset, quote_asset, epoch_timestamp, all_bars, timespan)
+        plural: str = "s" if all_bars else ""
+        self.__logger.debug("Retrieving cached bar%s for %s, %s at %s", plural, base_asset, quote_asset, epoch_timestamp)
+        bars: Optional[List[HistoricalBar]] = self._retrieve_cached_bars(base_asset, quote_asset, epoch_timestamp, all_bars, timespan)
 
-        return None
+        # Newer than Kraken's CSV data for the pair, e.g. in the current quarter
+        minute_candles: Optional[_PairStartEnd] = self.__cached_pairs.get(pair + _MINUTE_IN_MINUTES)
+        if bars is None and not all_bars and minute_candles is not None and epoch_timestamp > minute_candles.end:
+            return self.__find_bar_in_trades(pair, epoch_timestamp)
+        return bars
 
-    def _unzip_and_chunk(self, base_asset: str, quote_asset: str, all_bars: bool = False) -> bool:
+    def __find_bar_in_trades(self, pair: str, timestamp: int) -> Optional[List[HistoricalBar]]:
+        self.__logger.debug("Retrieving bar for %s at %s from Kraken's trades.", pair, timestamp)
+        historical_bar: Optional[HistoricalBar] = self.__trades.find_bar(pair, timestamp)
+        return [historical_bar] if historical_bar is not None else None
+
+    def _unzip_and_chunk(self, base_asset: str, quote_asset: str, all_bars: bool = False, timespan: str = _MINUTE_IN_STR) -> bool:
         # This function was called because the trading pair hasn't been chunked yet.
-        # In order to chunk a new trading pair, we need the unified CSV file.
-        if not path.exists(self.__UNIFIED_CSV_FILE) and (self.__force_download or self._prompt_download_confirmation()):
-            self.__download_unified_csv()
+        # Only the timeframes used for pricing are read. Picking routes reads the weekly candles of all the markets of an asset,
+        # and those are emulated from daily candles, so that's all it needs.
+        prefix: str = base_asset if all_bars else f"{base_asset}{quote_asset}_"
+        timeframes: List[str] = [_ONE_DAY_IN_MINUTES] if all_bars and timespan == _ONE_WEEK_IN_STR else _KRAKEN_TIME_GRANULARITY[:-1]
+        suffixes: Tuple[str, ...] = tuple(f"_{minutes}.csv" for minutes in timeframes)
 
-        self.__logger.info("Attempting to retrieve %s%s pair from the unified Kraken CSV file.", base_asset, quote_asset)
-        successful = False
-        for _ in range(2):
+        def is_needed(file_name: str) -> bool:
+            return file_name.startswith(prefix) and file_name.endswith(suffixes)
+
+        csv_files: Dict[str, str] = {}
+        source: str
+        if path.exists(self.__UNIFIED_CSV_FILE):
+            self.__logger.info("Attempting to retrieve %s%s pair from the unified Kraken CSV file.", base_asset, quote_asset)
             try:
                 with ZipFile(self.__UNIFIED_CSV_FILE, "r") as zip_ref:
-                    all_timespans_for_pair: List[str]
-                    if all_bars:
-                        all_timespans_for_pair = [x for x in zip_ref.namelist() if x.startswith(f"{base_asset}")]
-                    else:
-                        all_timespans_for_pair = [x for x in zip_ref.namelist() if x.startswith(f"{base_asset}{quote_asset}_")]
-
-                    self.__logger.debug("Chunking: %s", all_timespans_for_pair)
-
-                    if all_timespans_for_pair:
-                        csv_files: Dict[str, str] = {}
-                        for file_name in all_timespans_for_pair:
-                            self.__logger.debug("Reading in file %s for Kraken CSV pricing.", file_name)
-                            csv_files[file_name] = zip_ref.read(file_name).decode(encoding="utf-8")
-
-                        with ThreadPool(self.__THREAD_COUNT) as pool:
-                            pool.starmap(self._split_chunks_size_n, zip(list(csv_files.keys()), list(csv_files.values())))
-                        successful = True
-                        break
-                    self.__logger.debug("Market %s%s not found in Kraken files. Skipping file read.", base_asset, quote_asset)
-                    return False
+                    for file_name in [name for name in zip_ref.namelist() if is_needed(name)]:
+                        self.__logger.debug("Reading in file %s for Kraken CSV pricing.", file_name)
+                        csv_files[file_name] = zip_ref.read(file_name).decode(encoding="utf-8")
             except BadZipFile:
-                self.__logger.info("Corrupt unified CSV file found, deleting and trying again.")
+                self.__logger.warning("The unified CSV file is corrupt, so it has been deleted. Prices will be downloaded from Kraken instead.")
                 self._remove_unified_csv_file()
-                if self.__force_download or self._prompt_download_confirmation():
-                    self.__download_unified_csv()
+                return self._unzip_and_chunk(base_asset, quote_asset, all_bars, timespan)
+            source = _LOCAL_SOURCE
+        else:
+            release: KrakenRelease = self.__get_release()
+            try:
+                file_names: List[str] = [name for name in release.namelist() if is_needed(name)]
+                if file_names:
+                    self.__logger.info(
+                        "Downloading %s candles from Kraken's %s release (%.1f MB).",
+                        prefix.rstrip("_"),
+                        release.name,
+                        sum(release.compressed_size(file_name) for file_name in file_names) / 1e6,
+                    )
+                for file_name in file_names:
+                    csv_files[file_name] = release.read(file_name).decode(encoding="utf-8")
+            except (RequestException, RP2RuntimeError, BadZipFile, EOFError, zlib.error) as exc:
+                raise RP2RuntimeError(f"Couldn't download the {prefix.rstrip('_')} candles from Kraken ({exc}). {_NO_REST_FALLBACK}") from exc
+            source = release.name
 
-        if not successful:
-            raise RP2RuntimeError("CSV file is either corrupt or not available. Giving up.")
+        if not csv_files:
+            self.__logger.debug("Market %s%s not found in Kraken files. Skipping file read.", base_asset, quote_asset)
+            return False
+
+        with ThreadPool(self.__THREAD_COUNT) as pool:
+            pool.starmap(self._split_chunks_size_n, zip(list(csv_files.keys()), list(csv_files.values())))
 
         save_to_cache(self.cache_key(), self.__cached_pairs)
-        self.__unchunked_assets.discard(base_asset)
-        self.__logger.debug("Leftover assets: %s", self.__unchunked_assets)
-        if len(self.__unchunked_assets) == 0 and self._prompt_delete_confirmation():
-            self._remove_unified_csv_file()
+        save_to_cache(self.__SOURCE_CACHE_KEY, source)
+        if source == _LOCAL_SOURCE:
+            self.__unchunked_assets.discard(base_asset)
+            self.__logger.debug("Leftover assets: %s", self.__unchunked_assets)
+            if len(self.__unchunked_assets) == 0 and self._prompt_delete_confirmation():
+                self._remove_unified_csv_file()
 
         return True
 
     # Quarterly updates are sometimes released by Kraken before the unified CSV file is updated.
     # This merges such an update file into the unified CSV file.
     def __merge_update_file(self, update_file: str) -> None:
-        if not path.exists(self.__UNIFIED_CSV_FILE) and (self.__force_download or self._prompt_download_confirmation()):
-            self.__download_unified_csv()
-
         if not path.exists(self.__UNIFIED_CSV_FILE):
             self.__logger.warning(
-                "Can't merge the update file %s without the unified CSV file %s. The update file has been kept and will be merged once the "
-                "unified CSV file is downloaded.",
+                "The update file %s wasn't merged, because update files are only merged into a local unified CSV file (%s). Without one, "
+                "prices are downloaded from Kraken's latest release instead. The update file has been kept.",
                 update_file,
                 self.__UNIFIED_CSV_FILE,
             )
@@ -603,21 +562,10 @@ class Kraken:
             if path.exists(temporary_zip_file):
                 remove(temporary_zip_file)
 
-    def _prompt_download_confirmation(self) -> bool:
-        self.__logger.info("\nIn order to provide accurate pricing from Kraken, a large (4.1+ gb) zipfile needs to be downloaded.")
-
-        while True:
-            choice = input("Do you want to download the file now?[yn]")
-            if choice == "y":
-                return True
-            if choice == "n":
-                return False
-            self.__logger.info("Invalid choice. Please enter y or n.")
-
     def _prompt_delete_confirmation(self) -> bool:
         self.__logger.info(
             "\nAll of the CSV files for your assets have been processed. You can probably safely delete the master CSV file "
-            "located at %s. However, if you add assets later, you will need to re-download the file.",
+            "located at %s. If you add assets later, their prices will be downloaded from Kraken instead.",
             self.__UNIFIED_CSV_FILE,
         )
 
