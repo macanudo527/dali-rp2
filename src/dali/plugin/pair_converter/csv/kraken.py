@@ -29,9 +29,9 @@ from datetime import datetime, timedelta, timezone
 from gzip import open as gopen
 from json import JSONDecodeError
 from multiprocessing.pool import ThreadPool
-from os import makedirs, path, remove
-from typing import Dict, Generator, List, NamedTuple, Optional, Set, Tuple, cast
-from zipfile import BadZipFile, ZipFile, is_zipfile, ZIP_DEFLATED
+from os import makedirs, path, remove, replace
+from typing import IO, Dict, Generator, List, NamedTuple, Optional, Set, Tuple, cast
+from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile, is_zipfile
 
 import requests
 from progressbar import ProgressBar, UnknownLength
@@ -126,7 +126,7 @@ _PAIR_MIDDLE: str = "middle"
 _PAIR_END: str = "end"
 _MAX_MULTIPLIER: int = 500
 
-# Download chunks
+# Download and copy chunks
 _CHUNK_SIZE_BYTES: int = 32768  # 32kb
 
 DAYS_IN_WEEK: int = 7
@@ -135,6 +135,34 @@ DAYS_IN_WEEK: int = 7
 class _PairStartEnd(NamedTuple):
     end: int
     start: int
+
+
+# Copies in chunks, so memory use stays flat no matter the size of the file.
+# Returns the last two chunks copied, which is plenty to hold the last row of a CSV.
+def _copy_stream(source: IO[bytes], destination: IO[bytes]) -> bytes:
+    previous_chunk: bytes = b""
+    last_chunk: bytes = b""
+    while chunk := source.read(_CHUNK_SIZE_BYTES):
+        destination.write(chunk)
+        previous_chunk, last_chunk = last_chunk, chunk
+    return previous_chunk + last_chunk
+
+
+# Timestamp of the last row in the CSV data, or None if there are no rows
+def _last_timestamp(csv_data: bytes) -> Optional[int]:
+    last_row: bytes = csv_data.rstrip(b"\r\n").rsplit(b"\n", 1)[-1]
+    return int(last_row.split(b",", 1)[0]) if last_row else None
+
+
+# Copies only the CSV rows newer than timestamp (all of them if timestamp is None).
+# Rows are in chronological order, so once a newer row is found the rest is copied as is.
+def _copy_rows_newer_than(source: IO[bytes], destination: IO[bytes], timestamp: Optional[int]) -> None:
+    if timestamp is not None:
+        for row in source:
+            if int(row.split(b",", 1)[0]) > timestamp:
+                destination.write(row)
+                break
+    _copy_stream(source, destination)
 
 
 class Kraken:
@@ -160,22 +188,13 @@ class Kraken:
 
     __DELIMITER: str = ","
 
-    def __init__(self, transaction_manifest: TransactionManifest, force_download: bool = False, update_file: str = None) -> None:
+    def __init__(self, transaction_manifest: TransactionManifest, force_download: bool = False, update_file: Optional[str] = None) -> None:
         self.__logger: logging.Logger = create_logger(self.__KRAKEN_OHLCVT)
         self.__session: Session = requests.Session()
         self.__cached_pairs: Dict[str, _PairStartEnd] = {}
         self.__cache_loaded: bool = False
         self.__force_download: bool = force_download
         self.__unchunked_assets: Set[str] = transaction_manifest.assets
-
-        self.__logger.info("Path to update file: %s", update_file)
-        if path.exists(update_file):
-            self.__logger.info("Update file found. Combining the unified CSV file with the update file.")
-
-        if update_file is not None and path.exists(update_file):
-            self.__logger.info("Combining the unified CSV file with the update file. This may take a few minutes.")
-            self.__logger.info("After the process is complete the update file will be deleted.")
-            self.combine_zip_files(self.__UNIFIED_CSV_FILE, update_file, self.__UNIFIED_CSV_FILE)
 
         self.__logger.debug("Assets: %s", self.__unchunked_assets)
 
@@ -184,6 +203,10 @@ class Kraken:
 
         if not path.exists(self.__CSV_DIRECTORY):
             makedirs(self.__CSV_DIRECTORY)
+
+        self.__logger.debug("Path to update file: %s", update_file)
+        if update_file is not None and path.exists(update_file):
+            self.__merge_update_file(update_file)
 
     def cache_key(self) -> str:
         return self.__CACHE_KEY
@@ -519,35 +542,66 @@ class Kraken:
 
         return True
 
-    # This function is used to combine two zip files into a new zip file.
-    # This is sometimes necessary when quarterly updates are released by Kraken, but
-    # the unified CSV file is not updated yet.
-    def combine_zip_files(self, zip_file1, zip_file2, output_zip_file):
-        csv_files = {}
+    # Quarterly updates are sometimes released by Kraken before the unified CSV file is updated.
+    # This merges such an update file into the unified CSV file.
+    def __merge_update_file(self, update_file: str) -> None:
+        if not path.exists(self.__UNIFIED_CSV_FILE) and (self.__force_download or self._prompt_download_confirmation()):
+            self.__download_unified_csv()
 
-        # Read the first zip file
-        with ZipFile(zip_file1, 'r') as zip_ref1:
-            for file_name in zip_ref1.namelist():
-                if file_name.endswith('.csv'):
-                    csv_files[file_name] = zip_ref1.read(file_name).decode(encoding="utf-8")
+        if not path.exists(self.__UNIFIED_CSV_FILE):
+            self.__logger.warning(
+                "Can't merge the update file %s without the unified CSV file %s. The update file has been kept and will be merged once the "
+                "unified CSV file is downloaded.",
+                update_file,
+                self.__UNIFIED_CSV_FILE,
+            )
+            return
 
-        # Read the second zip file and append data to existing csv files or add new csv files
-        with ZipFile(zip_file2, 'r') as zip_ref2:
-            for file_name in zip_ref2.namelist():
-                if file_name.endswith('.csv'):
-                    csv_data = zip_ref2.read(file_name).decode(encoding="utf-8")
-                    if file_name in csv_files:
-                        csv_files[file_name] += csv_data
-                    else:
-                        csv_files[file_name] = csv_data
+        # Pairs chunked before the merge are missing the new data, so they need to be chunked again.
+        # This is done before merging, so that a failed merge can't leave stale pairs cached.
+        self.__cached_pairs = {}
+        save_to_cache(self.cache_key(), self.__cached_pairs)
 
-        # Write the combined csv files to a new zip file
-        with ZipFile(output_zip_file, 'w', ZIP_DEFLATED) as zip_out:
-            for file_name, data in csv_files.items():
-                zip_out.writestr(file_name, data)
+        self.__logger.info("Merging the update file %s into the unified CSV file. This may take a few minutes.", update_file)
+        self._combine_zip_files(self.__UNIFIED_CSV_FILE, update_file)
 
-        # Remove update file so that the process isn't repeated
-        remove(zip_file2)
+        # Remove update file so that the merge isn't repeated
+        remove(update_file)
+        self.__logger.info("Merge complete. The update file %s has been deleted.", update_file)
+
+    # Appends the CSVs in the update zip file to the ones in the unified zip file, adding any CSV that is new.
+    # Update CSVs are matched by file name, even if they are in a folder, and rows the unified file already has are skipped,
+    # so merging an update that overlaps the unified file, or merging the same update twice, doesn't duplicate rows.
+    # The unified file is 4+ GB, so CSVs are streamed rather than loaded into memory, and the result is written to a
+    # temporary file that replaces the unified file only once it's complete, so a failure can't corrupt the unified file.
+    def _combine_zip_files(self, unified_zip_file: str, update_zip_file: str) -> None:
+        temporary_zip_file: str = unified_zip_file + ".tmp"
+        try:
+            with ZipFile(unified_zip_file, "r") as unified_zip, ZipFile(update_zip_file, "r") as update_zip, ZipFile(
+                temporary_zip_file, "w", ZIP_DEFLATED
+            ) as combined_zip:
+                # File name -> path inside the update zip file
+                update_csv_files: Dict[str, str] = {path.basename(name): name for name in update_zip.namelist() if name.endswith(".csv")}
+
+                for file_name in unified_zip.namelist():
+                    with unified_zip.open(file_name) as source, combined_zip.open(file_name, "w", force_zip64=True) as destination:
+                        unified_csv_tail: bytes = _copy_stream(source, destination)
+                        if file_name in update_csv_files:
+                            # Otherwise the last row of the unified CSV and the first row of the update would end up on the same line
+                            if unified_csv_tail and not unified_csv_tail.endswith(b"\n"):
+                                destination.write(b"\n")
+                            with update_zip.open(update_csv_files[file_name]) as update_source:
+                                _copy_rows_newer_than(update_source, destination, _last_timestamp(unified_csv_tail))
+
+                for file_name in sorted(update_csv_files.keys() - set(unified_zip.namelist())):
+                    with update_zip.open(update_csv_files[file_name]) as source, combined_zip.open(file_name, "w", force_zip64=True) as destination:
+                        _copy_stream(source, destination)
+
+            replace(temporary_zip_file, unified_zip_file)
+        finally:
+            # Only exists if something went wrong before the unified file was replaced
+            if path.exists(temporary_zip_file):
+                remove(temporary_zip_file)
 
     def _prompt_download_confirmation(self) -> bool:
         self.__logger.info("\nIn order to provide accurate pricing from Kraken, a large (4.1+ gb) zipfile needs to be downloaded.")
