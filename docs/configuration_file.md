@@ -459,6 +459,7 @@ default_exchange = <em>&lt;default_exchange&gt;</em>
 fiat_priority = <em>&lt;fiat_priority&gt;</em>
 untradeable_assets = <em>&lt;untradeable_assets&gt;</em>
 aliases = <em>&lt;untradeable_assets&gt;</em>
+kraken_csv_update_file = <em>&lt;kraken_csv_update_file&gt;</em>
 </pre>
 
 Where:
@@ -471,6 +472,8 @@ Where:
 ```ini
 aliases = UNIVERSAL, XETH, ETH, 1; Kraken, KILOBTC, BTC, 1000; Kraken, SATOSHI, BTC, 0.00000001
 ```
+
+* `kraken_csv_update_file` is an optional path to a quarterly update file from Kraken. DaLI merges it into the unified CSV file, so Kraken prices can use a new quarter's data before the unified CSV file includes it. See the [note on quarterly update files](#note-on-quarterly-update-files) below.
 
 The CCXT pair converter plugin uses a routing system to find the shortest pricing path between a base asset and a quote asset (what the asset is priced in). It does this by assembling a graph of nodes made out of assets and edges made from markets with a preference for the exchange the asset was purchased on. Fiat exchange rates from the European Central Bank are also added to the graph to allow any fiat to be converted between each other.
 
@@ -501,10 +504,20 @@ transaction age    | candle used
 7.5 - 30 days old  |          1h
 1 - 4 months old   |          4h
 
-Accuracy will improve once new CSV data is released, which is typically 2 weeks after the end of a quarter. Also, the Kraken REST API is very slow. It may take 20-30 seconds per transaction to retrieve prices for the latest quarter.
+Accuracy will improve once new CSV data is released, which is typically 2 weeks after the end of a quarter. You can use the new data as soon as it's released with `kraken_csv_update_file` (see the [note on quarterly update files](#note-on-quarterly-update-files) below). Also, the Kraken REST API is very slow. It may take 20-30 seconds per transaction to retrieve prices for the latest quarter.
 
 ##### Note on Unified CSV File
 The unified CSV file is a CSV file that contains all the candles for all the assets on the Kraken exchange. It is used to retrieve the price for the transaction if the transaction is older than the latest quarter. The plugin will prompt you to download the unified CSV file if it is needed for the transaction. It is 4 GB as of April 2024. You can also manually download the file from the <!-- markdown-link-check-disable -->[Kraken Exchange](https://support.kraken.com/hc/en-us/articles/360047124832-Downloadable-historical-OHLCVT-Open-High-Low-Close-Volume-Trades-data)<!-- markdown-link-check-enable --> and put it in `.dali_cache/kraken/csv/`.
+
+##### Note on Quarterly Update Files
+Kraken publishes the data for each new quarter as a separate update file, which the unified CSV file may not include yet. To use it right away, download the update file and set `kraken_csv_update_file` to its path (absolute, or relative to the directory you run DaLI from). The first time DaLI needs a price from Kraken, it merges the update file into the unified CSV file and then deletes the update file. You can leave the parameter set: it is ignored until you put a new update file at the same path.
+
+Be aware that:
+* Merging rewrites the 4+ GB unified CSV file. It can take a few minutes and needs enough free disk space for a temporary copy of it. If the merge fails, the unified CSV file is left unchanged and the update file is kept.
+* If the unified CSV file hasn't been downloaded yet, DaLI offers to download it first. If you decline, the update file is kept and merged on a later run.
+* Rows the unified CSV file already has are skipped, so an update that overlaps it doesn't create duplicates. Markets that are new in the update are added.
+* After a merge, each Kraken market is read again from the unified CSV file the first time it's needed, so the first price lookups are slower.
+* Prices DaLI has already looked up are cached, and a merge doesn't change them. To price those transactions again with the new data, delete the plugin's price cache: `.dali_cache/Frankfurter` for the CCXT plugin or `.dali_cache/Fiat from exchangerate.host` for the CCXT Exchangerate Host plugin. Don't delete `.dali_cache/kraken/`, which holds the unified CSV file.
 
 ### CCXT Exchangerate Host
 This plugin is based on the CCXT Python library. It uses the Exchangerate.host API for forex rates.
@@ -518,6 +531,7 @@ fiat_access_key = <em>&lt;fiat_access_key&gt;</em>
 fiat_priority = <em>&lt;fiat_priority&gt;</em>
 untradeable_assets = <em>&lt;untradeable_assets&gt;</em>
 aliases = <em>&lt;untradeable_assets&gt;</em>
+kraken_csv_update_file = <em>&lt;kraken_csv_update_file&gt;</em>
 </pre>
 
 Where:

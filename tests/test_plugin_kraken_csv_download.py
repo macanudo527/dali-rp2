@@ -44,6 +44,12 @@ _UPDATE_ROW: str = f"{_UPDATE_TIMESTAMP},2.1111,2.2222,2.0000,2.1234,21.21,21\n"
 # Candle for a pair that isn't in _UNIFIED_TEST_FILE
 _NEW_PAIR_ROW: str = f"{_UPDATE_TIMESTAMP},13500.1,13500.2,13500.0,13500.1,1.5,3\n"
 
+# Synthetic XBTUSD candles in every Kraken timeframe up to the end of 2020, and a quarterly update that continues them from
+# 2020-12-31 23:30 (30 minutes of overlap) and adds MATICUSD. All timeframes are aggregated from the same 1 minute candles.
+# Finer timeframes cover a shorter history to keep the files small, and there were no XBTUSD trades at 2021-01-01 00:03.
+_UNIFIED_FIXTURE: str = "input/Kraken_OHLCVT_unified_test.zip"
+_UPDATE_FIXTURE: str = "input/Kraken_OHLCVT_update_test.zip"
+
 # Fake Transaction
 FAKE_TRANSACTION: InTransaction = InTransaction(
     plugin="Plugin",
@@ -98,6 +104,16 @@ def unified_csv_file_fixture(tmp_path: Path, mocker: MockerFixture) -> Path:
     mocker.patch.object(Kraken, "_prompt_delete_confirmation", return_value=False)
 
     return unified_csv_file
+
+
+@pytest.fixture(name="merged_kraken_csv")
+def merged_kraken_csv_fixture(unified_csv_file: Path, tmp_path: Path) -> Kraken:
+    unified_csv_file.parent.mkdir(parents=True)
+    copyfile(_UNIFIED_FIXTURE, unified_csv_file)
+    # The merge deletes the update file, so merge a copy
+    update_file: Path = tmp_path / "update.zip"
+    copyfile(_UPDATE_FIXTURE, update_file)
+    return Kraken(transaction_manifest=_manifest(), update_file=str(update_file))
 
 
 class TestKrakenCsvDownload:
@@ -313,3 +329,56 @@ class TestKrakenCsvUpdateFile:
 
         # The plugin only looks for CSVs at the top level of the unified file
         assert _read_zip(unified_csv_file) == {"USDTUSD_1.csv": _LAST_UNIFIED_ROW + _UPDATE_ROW, "XBTUSD_1.csv": _NEW_PAIR_ROW}
+
+
+class TestKrakenCsvUpdateFileFixtures:
+    @pytest.mark.usefixtures("merged_kraken_csv")
+    def test_merge_keeps_every_candle_once_in_order(self, unified_csv_file: Path) -> None:
+        unified_contents: Dict[str, str] = _read_zip(Path(_UNIFIED_FIXTURE))
+        update_contents: Dict[str, str] = _read_zip(Path(_UPDATE_FIXTURE))
+        merged_contents: Dict[str, str] = _read_zip(unified_csv_file)
+
+        assert merged_contents.keys() == unified_contents.keys() | update_contents.keys()
+        for file_name, merged_csv in merged_contents.items():
+            rows: List[str] = merged_csv.splitlines()
+            timestamps: List[int] = [int(row.split(",")[0]) for row in rows]
+            # In chronological order without duplicates, even where the update overlaps the unified file
+            assert timestamps == sorted(set(timestamps)), file_name
+            assert set(rows) == set(unified_contents.get(file_name, "").splitlines()) | set(update_contents.get(file_name, "").splitlines()), file_name
+
+    def test_prices_come_from_both_sides_of_the_boundary(self, merged_kraken_csv: Kraken) -> None:
+        # Last 1 minute candle of the unified file
+        test_bar: Optional[HistoricalBar] = merged_kraken_csv.find_historical_bar("BTC", "USD", datetime(2020, 12, 31, 23, 59, tzinfo=timezone.utc))
+        assert test_bar
+        assert test_bar.duration == timedelta(minutes=1)
+        assert test_bar.close == RP2Decimal("28990.0")
+
+        # First new 1 minute candle of the update file
+        test_bar = merged_kraken_csv.find_historical_bar("BTC", "USD", datetime(2021, 1, 1, 0, 0, tzinfo=timezone.utc))
+        assert test_bar
+        assert test_bar.duration == timedelta(minutes=1)
+        assert test_bar.close == RP2Decimal("28986.5")
+
+    def test_minute_without_trades_is_priced_from_the_five_minute_candle(self, merged_kraken_csv: Kraken) -> None:
+        test_bar: Optional[HistoricalBar] = merged_kraken_csv.find_historical_bar("BTC", "USD", datetime(2021, 1, 1, 0, 3, tzinfo=timezone.utc))
+
+        assert test_bar
+        assert test_bar.duration == timedelta(minutes=5)
+        assert test_bar.timestamp == datetime(2021, 1, 1, 0, 0, tzinfo=timezone.utc)
+        assert test_bar.close == RP2Decimal("28961.9")
+
+    def test_pair_only_in_the_update_file_can_be_priced(self, merged_kraken_csv: Kraken) -> None:
+        test_bar: Optional[HistoricalBar] = merged_kraken_csv.find_historical_bar("MATIC", "USD", datetime(2021, 1, 10, 12, 0, tzinfo=timezone.utc))
+
+        # The finest MATICUSD candles the fixture has for this date are 12 hour candles
+        assert test_bar
+        assert test_bar.duration == timedelta(hours=12)
+        assert test_bar.close == RP2Decimal("0.029514")
+
+    def test_weekly_candle_spans_the_boundary(self, merged_kraken_csv: Kraken) -> None:
+        test_bars: Optional[List[HistoricalBar]] = merged_kraken_csv.find_historical_bars("BTC", "USD", datetime(2020, 12, 28, tzinfo=timezone.utc), True, "1w")
+
+        assert test_bars
+        assert test_bars[0].timestamp == datetime(2020, 12, 28, tzinfo=timezone.utc)
+        # Sum of the daily volumes of 2020-12-28 to 2020-12-31 from the unified file and 2021-01-01 to 2021-01-03 from the update file
+        assert test_bars[0].volume == RP2Decimal("32822.59186282")
