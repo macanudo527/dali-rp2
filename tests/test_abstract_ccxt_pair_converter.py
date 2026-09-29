@@ -23,6 +23,7 @@ from rp2.rp2_error import RP2ValueError
 from dali.abstract_ccxt_pair_converter_plugin import (
     _BINANCE,
     _COINBASE_PRO,
+    _KRAKEN,
     _ONE_HOUR,
     _SIX_HOUR,
     _TIME_GRANULARITY,
@@ -252,6 +253,19 @@ class TestAbstractCcxtPairConverterPlugin:
         assert refined_optimizations[datetime(2023, 1, 10)]["A"]["B"] == 3.0
         assert refined_optimizations[datetime(2023, 1, 10)]["A"]["C"] == 2.0
         assert refined_optimizations[datetime(2023, 1, 10)]["A"]["D"] == 1.0
+
+    def test_matic_is_priced_from_krakens_historical_market(self) -> None:
+        plugin = MockAbstractCcxtPairConverterPlugin(Keyword.HISTORICAL_PRICE_HIGH.value)
+        graph: MappedGraph[str] = MappedGraph[str]("Pionex")
+        current_markets: Dict[str, List[str]] = {}
+
+        plugin._add_alternative_markets(graph, current_markets)  # pylint: disable=protected-access
+
+        # MATIC was replaced by POL, so exchanges no longer list MATIC markets, but Kraken's CSV data still has MATICUSD
+        assert current_markets["MATICUSD"] == [_KRAKEN]
+        matic: Optional[Vertex[str]] = graph.get_vertex("MATIC")
+        assert matic
+        assert "USD" in {neighbor.name for neighbor in matic.neighbors}
 
     # To be enabled when _fetch_historical_bars is implemented
     def disabled_test_find_historical_bars_add_to_cache(self, mocker: Any, historical_bars: Dict[str, HistoricalBar]) -> None:

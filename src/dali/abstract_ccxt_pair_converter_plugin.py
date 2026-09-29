@@ -149,6 +149,7 @@ _ALT_MARKET_EXCHANGES_DICT: Dict[str, str] = {
     "CYBERUSDT": _BINANCE,
     "EDGUSDT": _GATE,
     "ETHWUSD": _KRAKEN,
+    "MATICUSD": _KRAKEN,  # Replaced by POL, so no longer listed, but Kraken's CSV data has it until 2025-03-31
     "MAVUSDT": _BINANCE,
     "NEXOUSDT": _BITFINEX,  # To be replaced with Huobi once a CSV plugin is available
     "OPUSDT": _BINANCE,
@@ -175,6 +176,7 @@ _ALT_MARKET_BY_BASE_DICT: Dict[str, str] = {
     "CYBER": "USDT",
     "EDG": "USDT",
     "ETHW": "USD",
+    "MATIC": "USD",
     "MAV": "USDT",
     "NEXO": "USDT",
     "OP": "USDT",
