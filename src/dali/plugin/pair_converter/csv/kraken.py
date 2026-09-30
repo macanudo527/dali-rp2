@@ -21,12 +21,15 @@
 
 import logging
 import zlib
+from array import array
+from bisect import bisect_left
+from collections import OrderedDict
 from csv import reader, writer
 from datetime import datetime, timedelta, timezone
 from gzip import open as gopen
 from multiprocessing.pool import ThreadPool
 from os import makedirs, path, remove, replace
-from typing import IO, Dict, Generator, List, NamedTuple, Optional, Set, Tuple, cast
+from typing import IO, Dict, Generator, Iterator, List, NamedTuple, Optional, Set, Tuple, cast
 from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 
 from requests import RequestException
@@ -114,6 +117,25 @@ class _PairStartEnd(NamedTuple):
     start: int
 
 
+# The rows of a chunk file, which are in time order
+class _Chunk:
+    def __init__(self, lines: List[str]) -> None:
+        self.__lines: List[str] = lines
+        self.__timestamps: "array[int]" = array("q", (int(line.split(",", 1)[0]) for line in lines))
+
+    # The row of the candle starting at timestamp, or None if there is no such candle
+    def row(self, timestamp: int) -> Optional[List[str]]:
+        index: int = bisect_left(self.__timestamps, timestamp)
+        if index < len(self.__timestamps) and self.__timestamps[index] == timestamp:
+            return self.__lines[index].split(",")
+        return None
+
+    # The rows of the candles starting at timestamp or later
+    def rows_from(self, timestamp: int) -> Iterator[List[str]]:
+        for line in self.__lines[bisect_left(self.__timestamps, timestamp) :]:
+            yield line.split(",")
+
+
 # Copies in chunks, so memory use stays flat no matter the size of the file.
 # Returns the last two chunks copied, which is plenty to hold the last row of a CSV.
 def _copy_stream(source: IO[bytes], destination: IO[bytes]) -> bytes:
@@ -159,6 +181,7 @@ class Kraken:
     __SOURCE_CACHE_KEY: str = "Kraken-csv-source"
 
     __THREAD_COUNT: int = 3
+    __CHUNKS_IN_MEMORY: int = 16
 
     __TIMESTAMP_INDEX: int = 0
     __OPEN: int = 1
@@ -183,6 +206,8 @@ class Kraken:
         self.__release: Optional[KrakenRelease] = None
         # Prices times newer than Kraken's CSV data online, e.g. in the current quarter
         self.__trades: KrakenTrades = KrakenTrades(self.__session)
+        # The chunk files read most recently, see __read_chunk
+        self.__chunks: "OrderedDict[str, _Chunk]" = OrderedDict()
 
         self.__logger.debug("Assets: %s", transaction_manifest.assets)
 
@@ -385,33 +410,13 @@ class Kraken:
                 else:
                     self.__logger.debug("Retrieving %s -> %s at %s from %s stamped file.", base_asset, quote_asset, duration_timestamp, file_timestamp)
                 try:
-                    with gopen(file_path, "rt") as file:
-                        rows = reader(file)
-                        for row in rows:
-                            if all_bars and int(row[self.__TIMESTAMP_INDEX]) >= duration_timestamp:
-                                result.append(
-                                    HistoricalBar(
-                                        duration=timedelta(minutes=int(_KRAKEN_TIME_GRANULARITY[retry_count])),
-                                        timestamp=datetime.fromtimestamp(int(row[self.__TIMESTAMP_INDEX]), timezone.utc),
-                                        open=RP2Decimal(row[self.__OPEN]),
-                                        high=RP2Decimal(row[self.__HIGH]),
-                                        low=RP2Decimal(row[self.__LOW]),
-                                        close=RP2Decimal(row[self.__CLOSE]),
-                                        volume=RP2Decimal(row[self.__VOLUME]),
-                                    )
-                                )
-                            elif int(row[self.__TIMESTAMP_INDEX]) == duration_timestamp:
-                                return [
-                                    HistoricalBar(
-                                        duration=timedelta(minutes=int(_KRAKEN_TIME_GRANULARITY[retry_count])),
-                                        timestamp=datetime.fromtimestamp(int(row[self.__TIMESTAMP_INDEX]), timezone.utc),
-                                        open=RP2Decimal(row[self.__OPEN]),
-                                        high=RP2Decimal(row[self.__HIGH]),
-                                        low=RP2Decimal(row[self.__LOW]),
-                                        close=RP2Decimal(row[self.__CLOSE]),
-                                        volume=RP2Decimal(row[self.__VOLUME]),
-                                    )
-                                ]
+                    chunk: _Chunk = self.__read_chunk(file_path)
+                    if all_bars:
+                        result.extend(self.__historical_bar(row, _KRAKEN_TIME_GRANULARITY[retry_count]) for row in chunk.rows_from(duration_timestamp))
+                    else:
+                        row: Optional[List[str]] = chunk.row(duration_timestamp)
+                        if row is not None:
+                            return [self.__historical_bar(row, _KRAKEN_TIME_GRANULARITY[retry_count])]
                 except FileNotFoundError:
                     self.__logger.error(
                         f"No such file={file_path} (skipping) {timestamp}. Please open an issue at %s %s", self.ISSUES_URL, datetime.fromtimestamp(timestamp)
@@ -424,6 +429,31 @@ class Kraken:
             retry_count += 1
 
         return None
+
+    # Transactions are priced in time order, so most lookups hit a chunk file read shortly before. Keeping the most
+    # recently used ones in memory saves decompressing and scanning up to a month of 1 minute candles for every price.
+    def __read_chunk(self, file_path: str) -> _Chunk:
+        chunk: Optional[_Chunk] = self.__chunks.get(file_path)
+        if chunk is None:
+            with gopen(file_path, "rt") as file:
+                chunk = _Chunk(file.read().splitlines())
+            self.__chunks[file_path] = chunk
+            if len(self.__chunks) > self.__CHUNKS_IN_MEMORY:
+                self.__chunks.popitem(last=False)
+        else:
+            self.__chunks.move_to_end(file_path)
+        return chunk
+
+    def __historical_bar(self, row: List[str], timeframe: str) -> HistoricalBar:
+        return HistoricalBar(
+            duration=timedelta(minutes=int(timeframe)),
+            timestamp=datetime.fromtimestamp(int(row[self.__TIMESTAMP_INDEX]), timezone.utc),
+            open=RP2Decimal(row[self.__OPEN]),
+            high=RP2Decimal(row[self.__HIGH]),
+            low=RP2Decimal(row[self.__LOW]),
+            close=RP2Decimal(row[self.__CLOSE]),
+            volume=RP2Decimal(row[self.__VOLUME]),
+        )
 
     def find_historical_bar(self, base_asset: str, quote_asset: str, timestamp: datetime) -> Optional[HistoricalBar]:
         historical_bars: Optional[List[HistoricalBar]] = self.find_historical_bars(base_asset, quote_asset, timestamp)
@@ -532,6 +562,8 @@ class Kraken:
 
         with ThreadPool(self.__THREAD_COUNT) as pool:
             pool.starmap(self._split_chunks_size_n, zip(list(csv_files.keys()), list(csv_files.values())))
+        # Chunk files were just written, so any copies in memory may be out of date
+        self.__chunks.clear()
 
         save_to_cache(self.cache_key(), self.__cached_pairs)
         save_to_cache(self.__SOURCE_CACHE_KEY, source)

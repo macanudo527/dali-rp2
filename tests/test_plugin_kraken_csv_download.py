@@ -30,6 +30,7 @@ from pytest_mock import MockerFixture
 from rp2.rp2_decimal import RP2Decimal
 from rp2.rp2_error import RP2RuntimeError, RP2ValueError
 
+import dali.plugin.pair_converter.csv.kraken as kraken_module
 from dali.cache import CACHE_DIR
 from dali.configuration import Keyword
 from dali.historical_bar import HistoricalBar
@@ -781,3 +782,40 @@ class TestKrakenCsvOffline:
 
         # The file is the user's own copy, so it's left for them to replace
         assert unified_csv_file.exists()
+
+
+class TestKrakenCsvChunksInMemory:
+    @staticmethod
+    def __chunk_reads(read_spy: Any) -> int:
+        return sum(1 for call in read_spy.call_args_list if call.args[1] == "rt")
+
+    def test_consecutive_prices_read_their_chunk_file_once(self, unified_csv_file: Path, mocker: MockerFixture) -> None:
+        unified_csv_file.parent.mkdir(parents=True)
+        copyfile(_UNIFIED_FIXTURE, unified_csv_file)
+        read_spy = mocker.spy(kraken_module, "gopen")
+        kraken_csv: Kraken = Kraken(transaction_manifest=_manifest(), offline=True)
+
+        # Transactions are priced in time order, so they keep hitting the same month of 1 minute candles
+        closes: List[RP2Decimal] = []
+        for minute in (22, 30, 45, 58):
+            test_bar: Optional[HistoricalBar] = kraken_csv.find_historical_bar("BTC", "USD", datetime(2020, 12, 31, 23, minute, tzinfo=timezone.utc))
+            assert test_bar
+            assert test_bar.duration == timedelta(minutes=1)
+            closes.append(test_bar.close)
+
+        assert closes == [RP2Decimal("29307.8"), RP2Decimal("29260.0"), RP2Decimal("29140.1"), RP2Decimal("28988.1")]
+        assert self.__chunk_reads(read_spy) == 1
+
+    def test_older_chunks_are_dropped_from_memory(self, unified_csv_file: Path, mocker: MockerFixture) -> None:
+        unified_csv_file.parent.mkdir(parents=True)
+        copyfile(_UNIFIED_FIXTURE, unified_csv_file)
+        mocker.patch.object(Kraken, "_Kraken__CHUNKS_IN_MEMORY", 1)
+        read_spy = mocker.spy(kraken_module, "gopen")
+        kraken_csv: Kraken = Kraken(transaction_manifest=_manifest(), offline=True)
+
+        # A 1 minute candle, then a 12 hour one from another chunk file, then the 1 minute one again
+        for moment in (datetime(2020, 12, 31, 23, 58, tzinfo=timezone.utc), datetime(2020, 12, 15, 12, tzinfo=timezone.utc)) * 2:
+            assert kraken_csv.find_historical_bar("BTC", "USD", moment)
+
+        # With room for a single chunk in memory, each lookup reads its chunk file again
+        assert self.__chunk_reads(read_spy) == 4
