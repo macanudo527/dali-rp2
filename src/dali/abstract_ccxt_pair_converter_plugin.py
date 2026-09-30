@@ -152,7 +152,7 @@ _ALT_MARKET_EXCHANGES_DICT: Dict[str, str] = {
     "ETHWUSD": _KRAKEN,
     "MATICUSD": _KRAKEN,  # Replaced by POL, so no longer listed, but Kraken's CSV data has it until 2025-03-31
     "MAVUSDT": _BINANCE,
-    "NEXOUSDT": _BITFINEX,  # To be replaced with Huobi once a CSV plugin is available
+    "NEXOUSDT": _HUOBI,  # Bitfinex no longer lists NEXO, while Huobi has its 1 minute candles back to 2022
     "OPUSDT": _BINANCE,
     "RVNUSDT": _BINANCE,
     "SEIUSDT": _BINANCE,
