@@ -28,7 +28,7 @@ import pytest
 import requests
 from pytest_mock import MockerFixture
 from rp2.rp2_decimal import RP2Decimal
-from rp2.rp2_error import RP2RuntimeError
+from rp2.rp2_error import RP2RuntimeError, RP2ValueError
 
 from dali.cache import CACHE_DIR
 from dali.configuration import Keyword
@@ -235,8 +235,7 @@ def unified_csv_file_fixture(tmp_path: Path, mocker: MockerFixture) -> Path:
     mocker.patch.object(Kraken, "_Kraken__CSV_DIRECTORY", f"{csv_directory}/")
     mocker.patch.object(Kraken, "_Kraken__UNIFIED_CSV_FILE", str(unified_csv_file))
 
-    # Never block on input() or reach the real Kraken server
-    mocker.patch.object(Kraken, "_prompt_delete_confirmation", return_value=False)
+    # Never reach the real Kraken server
     mocker.patch("dali.plugin.pair_converter.csv.kraken.Session", return_value=_NoNetwork())
 
     return unified_csv_file
@@ -267,12 +266,14 @@ def merged_kraken_csv_fixture(unified_csv_file: Path, tmp_path: Path) -> Kraken:
     # The merge deletes the update file, so merge a copy
     update_file: Path = tmp_path / "update.zip"
     copyfile(_UPDATE_FIXTURE, update_file)
-    return Kraken(transaction_manifest=_manifest(), update_file=str(update_file))
+    return Kraken(transaction_manifest=_manifest(), update_file=str(update_file), offline=True)
 
 
 class TestKrakenCsvDownload:
     def test_chunking(self, mocker: Any) -> None:
-        kraken_csv = Kraken(transaction_manifest=TransactionManifest([FAKE_TRANSACTION], 1, "USD"))
+        # Offline mode checks that the local unified file exists when it starts, so point it at the test file first
+        mocker.patch.object(Kraken, "_Kraken__UNIFIED_CSV_FILE", "input/USD_OHLCVT_test.zip")
+        kraken_csv = Kraken(transaction_manifest=TransactionManifest([FAKE_TRANSACTION], 1, "USD"), offline=True)
 
         if not path.exists(_CACHE_DIRECTORY):
             makedirs(_CACHE_DIRECTORY)
@@ -293,8 +294,6 @@ class TestKrakenCsvDownload:
         mocker.patch.object(kraken_csv, "_Kraken__CACHE_DIRECTORY", _CACHE_DIRECTORY)
         if not path.exists(_CACHE_DIRECTORY):
             makedirs(_CACHE_DIRECTORY)
-
-        mocker.patch.object(kraken_csv, "_Kraken__UNIFIED_CSV_FILE", "input/USD_OHLCVT_test.zip")
 
         test_bar: Optional[HistoricalBar] = kraken_csv.find_historical_bar("USDT", "USD", datetime.fromtimestamp(1601856000))
         files: List[str] = listdir(_CACHE_DIRECTORY)
@@ -341,7 +340,7 @@ class TestKrakenCsvUpdateFile:
             },
         )
 
-        Kraken(transaction_manifest=_manifest(), update_file=str(update_file))
+        Kraken(transaction_manifest=_manifest(), update_file=str(update_file), offline=True)
 
         # Update rows are appended to existing pairs, new pairs are added and untouched pairs are kept
         assert _read_zip(unified_csv_file) == {
@@ -357,12 +356,12 @@ class TestKrakenCsvUpdateFile:
         copyfile(_UNIFIED_TEST_FILE, unified_csv_file)
 
         # First run chunks and caches USDTUSD, whose 1 minute candles end at _LAST_UNIFIED_ROW
-        assert Kraken(transaction_manifest=_manifest()).find_historical_bar("USDT", "USD", datetime.fromtimestamp(1601856000, timezone.utc))
+        assert Kraken(transaction_manifest=_manifest(), offline=True).find_historical_bar("USDT", "USD", datetime.fromtimestamp(1601856000, timezone.utc))
 
         # Second run brings in a newer candle through an update file
         update_file: Path = tmp_path / "update.zip"
         _write_zip(update_file, {"USDTUSD_1.csv": _UPDATE_ROW})
-        kraken_csv = Kraken(transaction_manifest=_manifest(), update_file=str(update_file))
+        kraken_csv = Kraken(transaction_manifest=_manifest(), update_file=str(update_file), offline=True)
 
         # The new candle must be found, not a stale lower resolution one from the old chunks
         test_bar: Optional[HistoricalBar] = kraken_csv.find_historical_bar("USDT", "USD", datetime.fromtimestamp(_UPDATE_TIMESTAMP, timezone.utc))
@@ -370,16 +369,28 @@ class TestKrakenCsvUpdateFile:
         assert test_bar.duration == timedelta(minutes=1)
         assert test_bar.close == RP2Decimal("2.1234")
 
-    def test_update_file_is_kept_when_unified_file_is_missing(self, unified_csv_file: Path, tmp_path: Path) -> None:
+    def test_offline_mode_without_a_local_unified_file_stops_with_an_error(self, unified_csv_file: Path, tmp_path: Path) -> None:
         update_file: Path = tmp_path / "update.zip"
         _write_zip(update_file, {"USDTUSD_1.csv": _UPDATE_ROW})
 
-        # Update files are only merged into a local unified file. Without one, prices come from Kraken's latest release.
-        Kraken(transaction_manifest=_manifest(), update_file=str(update_file))
+        with pytest.raises(RP2RuntimeError, match="Kraken_OHLCVT.zip"):
+            Kraken(transaction_manifest=_manifest(), update_file=str(update_file), offline=True)
 
-        # Keep the update file in case a local unified file is added later, and don't create one
+        # The update file is kept, so it can be merged once the local unified file is in place
         assert update_file.exists()
         assert not unified_csv_file.exists()
+
+    def test_update_file_needs_offline_mode(self, unified_csv_file: Path, tmp_path: Path) -> None:
+        unified_csv_file.parent.mkdir(parents=True)
+        copyfile(_UNIFIED_FIXTURE, unified_csv_file)
+        update_file: Path = tmp_path / "update.zip"
+        _write_zip(update_file, {"XBTUSD_1.csv": _UPDATE_ROW})
+
+        # Update files are only merged into the local unified file of offline mode. Online, Kraken's latest release is used instead.
+        with pytest.raises(RP2ValueError, match="kraken_csv_offline"):
+            Kraken(transaction_manifest=_manifest(), update_file=str(update_file))
+
+        assert update_file.exists()
 
     def test_failed_merge_leaves_unified_file_intact(self, unified_csv_file: Path, tmp_path: Path, mocker: MockerFixture) -> None:
         unified_csv_file.parent.mkdir(parents=True)
@@ -399,7 +410,7 @@ class TestKrakenCsvUpdateFile:
         mocker.patch.object(ZipFile, "open", open_zip_entry_without_disk_space)
 
         with pytest.raises(OSError, match="No space left on device"):
-            Kraken(transaction_manifest=_manifest(), update_file=str(update_file))
+            Kraken(transaction_manifest=_manifest(), update_file=str(update_file), offline=True)
 
         # The 4+ GB unified file must survive a failed merge, the update file must be kept for a retry
         # and no partially written temporary file may be left behind
@@ -416,7 +427,7 @@ class TestKrakenCsvUpdateFile:
 
         tracemalloc.start()
         try:
-            Kraken(transaction_manifest=_manifest(), update_file=str(update_file))
+            Kraken(transaction_manifest=_manifest(), update_file=str(update_file), offline=True)
             _, peak_memory = tracemalloc.get_traced_memory()
         finally:
             tracemalloc.stop()
@@ -430,7 +441,7 @@ class TestKrakenCsvUpdateFile:
         update_file: Path = tmp_path / "update.zip"
         _write_zip(update_file, {"USDTUSD_1.csv": _UPDATE_ROW})
 
-        Kraken(transaction_manifest=_manifest(), update_file=str(update_file))
+        Kraken(transaction_manifest=_manifest(), update_file=str(update_file), offline=True)
 
         assert _read_zip(unified_csv_file)["USDTUSD_1.csv"] == _LAST_UNIFIED_ROW + _UPDATE_ROW
 
@@ -442,7 +453,7 @@ class TestKrakenCsvUpdateFile:
         update_file: Path = tmp_path / "update.zip"
         _write_zip(update_file, {"USDTUSD_1.csv": "1604448060,1.9999,1.9999,1.9999,1.9999,1999.9999,99\n" + _LAST_UNIFIED_ROW + _UPDATE_ROW})
 
-        Kraken(transaction_manifest=_manifest(), update_file=str(update_file))
+        Kraken(transaction_manifest=_manifest(), update_file=str(update_file), offline=True)
 
         assert _read_zip(unified_csv_file)["USDTUSD_1.csv"] == original_csv + _UPDATE_ROW
 
@@ -452,12 +463,12 @@ class TestKrakenCsvUpdateFile:
         update_file: Path = tmp_path / "update.zip"
         update_csv_files: Dict[str, str] = {"USDTUSD_1.csv": _UPDATE_ROW, "XBTUSD_1.csv": _NEW_PAIR_ROW}
         _write_zip(update_file, update_csv_files)
-        Kraken(transaction_manifest=_manifest(), update_file=str(update_file))
+        Kraken(transaction_manifest=_manifest(), update_file=str(update_file), offline=True)
         merged_contents: Dict[str, str] = _read_zip(unified_csv_file)
 
         # E.g. the previous run was interrupted after the merge, but before the update file was deleted
         _write_zip(update_file, update_csv_files)
-        Kraken(transaction_manifest=_manifest(), update_file=str(update_file))
+        Kraken(transaction_manifest=_manifest(), update_file=str(update_file), offline=True)
 
         assert _read_zip(unified_csv_file) == merged_contents
 
@@ -466,7 +477,7 @@ class TestKrakenCsvUpdateFile:
         update_file: Path = tmp_path / "update.zip"
         _write_zip(update_file, {"Kraken_OHLCVT_Q4_2020/USDTUSD_1.csv": _UPDATE_ROW, "Kraken_OHLCVT_Q4_2020/XBTUSD_1.csv": _NEW_PAIR_ROW})
 
-        Kraken(transaction_manifest=_manifest(), update_file=str(update_file))
+        Kraken(transaction_manifest=_manifest(), update_file=str(update_file), offline=True)
 
         # The plugin only looks for CSVs at the top level of the unified file
         assert _read_zip(unified_csv_file) == {"USDTUSD_1.csv": _LAST_UNIFIED_ROW + _UPDATE_ROW, "XBTUSD_1.csv": _NEW_PAIR_ROW}
@@ -587,18 +598,22 @@ class TestKrakenCsvRemoteRelease:
         assert test_bar.duration == timedelta(minutes=1)
         assert test_bar.close == RP2Decimal("28986.5")
 
-    def test_local_unified_file_is_used_without_contacting_kraken(self, kraken_server: _FakeKrakenServer, unified_csv_file: Path) -> None:
+    def test_local_unified_file_is_ignored_when_online(self, kraken_server: _FakeKrakenServer, unified_csv_file: Path) -> None:
         kraken_server.publish("Kraken_OHLCVT_Full_2021Q1", _UPDATE_FIXTURE)
+        # E.g. an old unified file downloaded by a previous version of the plugin, which ends with 2020
         unified_csv_file.parent.mkdir(parents=True)
         copyfile(_UNIFIED_FIXTURE, unified_csv_file)
 
         test_bar: Optional[HistoricalBar] = Kraken(transaction_manifest=_manifest()).find_historical_bar(
-            "BTC", "USD", datetime(2020, 12, 31, 23, 59, tzinfo=timezone.utc)
+            "BTC", "USD", datetime(2021, 1, 1, 0, 0, tzinfo=timezone.utc)
         )
 
+        # Priced from Kraken's latest release, and the local file is left alone
         assert test_bar
-        assert test_bar.close == RP2Decimal("28990.0")
-        assert not kraken_server.requests
+        assert test_bar.duration == timedelta(minutes=1)
+        assert test_bar.close == RP2Decimal("28986.5")
+        assert kraken_server.downloaded
+        assert unified_csv_file.exists()
 
     def test_unreachable_kraken_stops_with_an_error(self, kraken_server: _FakeKrakenServer) -> None:
         kraken_server.publish("Kraken_OHLCVT_Full_2021Q1", _UPDATE_FIXTURE)
@@ -715,3 +730,54 @@ class TestKrakenTrades:
 
         with pytest.raises(RP2RuntimeError, match="Kraken"):
             Kraken(transaction_manifest=_manifest()).find_historical_bar("BTC", "USD", datetime.fromtimestamp(_JANUARY_1, timezone.utc))
+
+
+class TestKrakenCsvOffline:
+    def test_offline_mode_reads_only_the_local_unified_file(self, kraken_server: _FakeKrakenServer, unified_csv_file: Path) -> None:
+        kraken_server.publish("Kraken_OHLCVT_Full_2021Q1", _UPDATE_FIXTURE)
+        unified_csv_file.parent.mkdir(parents=True)
+        copyfile(_UNIFIED_FIXTURE, unified_csv_file)
+
+        test_bar: Optional[HistoricalBar] = Kraken(transaction_manifest=_manifest(), offline=True).find_historical_bar(
+            "BTC", "USD", datetime(2020, 12, 31, 23, 59, tzinfo=timezone.utc)
+        )
+
+        assert test_bar
+        assert test_bar.close == RP2Decimal("28990.0")
+        assert not kraken_server.requests
+
+    def test_offline_mode_stops_after_the_local_data_ends(self, kraken_server: _FakeKrakenServer, unified_csv_file: Path) -> None:
+        kraken_server.publish("Kraken_OHLCVT_Full_2021Q1", _UPDATE_FIXTURE)
+        kraken_server.add_trades("XBTUSD", [(_JANUARY_1 + 5, "29000.0", "0.5")])
+        unified_csv_file.parent.mkdir(parents=True)
+        copyfile(_UNIFIED_FIXTURE, unified_csv_file)
+
+        # The local data ends with 2020. Offline mode doesn't contact Kraken, and its REST API isn't accurate enough to use.
+        with pytest.raises(RP2RuntimeError, match="2020-12-31"):
+            Kraken(transaction_manifest=_manifest(), offline=True).find_historical_bar("BTC", "USD", datetime.fromtimestamp(_JANUARY_1, timezone.utc))
+        assert not kraken_server.requests
+
+    def test_offline_mode_stops_for_a_market_missing_from_the_local_data(self, unified_csv_file: Path) -> None:
+        unified_csv_file.parent.mkdir(parents=True)
+        copyfile(_UNIFIED_FIXTURE, unified_csv_file)
+
+        with pytest.raises(RP2RuntimeError, match="SOLUSD"):
+            Kraken(transaction_manifest=_manifest(), offline=True).find_historical_bar("SOL", "USD", datetime.fromtimestamp(_JANUARY_1, timezone.utc))
+
+    def test_offline_route_selection_skips_markets_missing_from_the_local_data(self, unified_csv_file: Path) -> None:
+        unified_csv_file.parent.mkdir(parents=True)
+        copyfile(_UNIFIED_FIXTURE, unified_csv_file)
+
+        # Picking routes only needs trading volumes, so a missing market isn't an error there
+        kraken_csv: Kraken = Kraken(transaction_manifest=_manifest(), offline=True)
+        assert kraken_csv.find_historical_bars("SOL", "USD", datetime(2020, 12, 7, tzinfo=timezone.utc), True, "1w") is None
+
+    def test_corrupt_local_unified_file_stops_with_an_error(self, unified_csv_file: Path) -> None:
+        unified_csv_file.parent.mkdir(parents=True)
+        unified_csv_file.write_bytes(b"not a zip file")
+
+        with pytest.raises(RP2RuntimeError, match="corrupt"):
+            Kraken(transaction_manifest=_manifest(), offline=True).find_historical_bar("BTC", "USD", datetime(2020, 12, 31, 23, 59, tzinfo=timezone.utc))
+
+        # The file is the user's own copy, so it's left for them to replace
+        assert unified_csv_file.exists()

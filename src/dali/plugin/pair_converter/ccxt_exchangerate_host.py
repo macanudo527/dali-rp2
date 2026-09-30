@@ -63,6 +63,7 @@ class PairConverterPlugin(AbstractCcxtPairConverterPlugin):
         untradeable_assets: Optional[str] = None,
         aliases: Optional[str] = None,
         kraken_csv_update_file: Optional[str] = None,
+        kraken_csv_offline: Optional[bool] = None,
     ) -> None:
         cache_modifier = fiat_priority if fiat_priority else ""
         super().__init__(
@@ -72,6 +73,7 @@ class PairConverterPlugin(AbstractCcxtPairConverterPlugin):
             aliases=aliases,
             cache_modifier=cache_modifier,
             kraken_csv_update_file=kraken_csv_update_file,
+            kraken_csv_offline=kraken_csv_offline,
         )
         self.__fiat_list: List[str] = []
         self._fiat_priority: Dict[str, float]

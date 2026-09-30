@@ -101,6 +101,10 @@ _LOCAL_SOURCE: str = "local unified CSV file"
 
 # Kraken's REST API only returns its latest 720 candles, so older prices from it come from coarse candles
 _NO_REST_FALLBACK: str = "Kraken's REST API isn't accurate enough to price from instead, so try again once Kraken can be reached."
+_UPDATE_FILE_NEEDS_OFFLINE: str = (
+    "kraken_csv_update_file only works with kraken_csv_offline = true, because update files are merged into the local Kraken_OHLCVT.zip "
+    "that offline mode uses. Without offline mode, DaLI downloads what it needs from Kraken's latest release instead."
+)
 
 DAYS_IN_WEEK: int = 7
 
@@ -138,6 +142,12 @@ def _copy_rows_newer_than(source: IO[bytes], destination: IO[bytes], timestamp: 
     _copy_stream(source, destination)
 
 
+# Update files are merged into the local unified CSV file, which only offline mode uses
+def check_kraken_csv_options(update_file: Optional[str], offline: bool) -> None:
+    if update_file is not None and not offline:
+        raise RP2ValueError(_UPDATE_FILE_NEEDS_OFFLINE)
+
+
 class Kraken:
     ISSUES_URL: str = "https://github.com/eprbell/dali-rp2/issues"
     __KRAKEN_OHLCVT: str = "Kraken.com_CSVOHLCVT"
@@ -160,18 +170,21 @@ class Kraken:
 
     __DELIMITER: str = ","
 
-    def __init__(self, transaction_manifest: TransactionManifest, update_file: Optional[str] = None) -> None:
+    # Online (the default), candles are downloaded from Kraken's latest release, and newer times are priced from Kraken's trades.
+    # Offline, only the local unified CSV file is used, and Kraken's servers are never contacted for candles.
+    def __init__(self, transaction_manifest: TransactionManifest, update_file: Optional[str] = None, offline: bool = False) -> None:
+        check_kraken_csv_options(update_file, offline)
         self.__logger: logging.Logger = create_logger(self.__KRAKEN_OHLCVT)
         self.__session: Session = Session()
+        self.__offline: bool = offline
         self.__cached_pairs: Dict[str, _PairStartEnd] = {}
         self.__cache_loaded: bool = False
-        # Kraken's latest release, used when there is no local unified CSV file. None until needed.
+        # Kraken's latest release, used online. None until needed.
         self.__release: Optional[KrakenRelease] = None
-        # Prices times newer than Kraken's CSV data, e.g. in the current quarter
+        # Prices times newer than Kraken's CSV data online, e.g. in the current quarter
         self.__trades: KrakenTrades = KrakenTrades(self.__session)
-        self.__unchunked_assets: Set[str] = transaction_manifest.assets
 
-        self.__logger.debug("Assets: %s", self.__unchunked_assets)
+        self.__logger.debug("Assets: %s", transaction_manifest.assets)
 
         if not path.exists(self.__CACHE_DIRECTORY):
             makedirs(self.__CACHE_DIRECTORY)
@@ -179,9 +192,18 @@ class Kraken:
         if not path.exists(self.__CSV_DIRECTORY):
             makedirs(self.__CSV_DIRECTORY)
 
+        if offline and not path.exists(self.__UNIFIED_CSV_FILE):
+            raise self.__missing_unified_csv_file_error()
+
         self.__logger.debug("Path to update file: %s", update_file)
         if update_file is not None and path.exists(update_file):
             self.__merge_update_file(update_file)
+
+    def __missing_unified_csv_file_error(self) -> RP2RuntimeError:
+        return RP2RuntimeError(
+            f"kraken_csv_offline is true, but there is no {self.__UNIFIED_CSV_FILE}. Download every part of Kraken's complete OHLCVT data and join "
+            "them into that file (see the docs), or turn kraken_csv_offline off to download only what's needed from Kraken."
+        )
 
     def cache_key(self) -> str:
         return self.__CACHE_KEY
@@ -189,11 +211,11 @@ class Kraken:
     def __load_cache(self) -> None:
         result = cast(Dict[str, _PairStartEnd], load_from_cache(self.cache_key()))
         self.__cached_pairs = result if result is not None else {}
-        if path.exists(self.__UNIFIED_CSV_FILE):
+        if self.__offline:
             return
 
-        # Without a local unified CSV file, pairs are read from Kraken's latest release. Once Kraken publishes a new
-        # release, the pairs read from the previous one are missing its data, so they are read again as they are needed.
+        # Online, pairs are read from Kraken's latest release. Once Kraken publishes a new release, the pairs read from
+        # the previous one (or from the local unified CSV file offline) are missing its data, so they are read again as needed.
         try:
             release: KrakenRelease = self.__get_release()
         except RP2RuntimeError as exc:
@@ -427,8 +449,16 @@ class Kraken:
         pair: str = base_asset + quote_asset
         cached_timeframe: str = _ONE_WEEK_IN_MINUTES if all_bars and timespan == _ONE_WEEK_IN_STR else _MINUTE_IN_MINUTES
         if not self.__cached_pairs.get(pair + cached_timeframe) and not self._unzip_and_chunk(base_asset, quote_asset, all_bars, timespan):
-            # Kraken's CSV data doesn't have the pair, e.g. because it was listed after the latest release
-            return None if all_bars else self.__find_bar_in_trades(pair, epoch_timestamp)
+            # Kraken's CSV data doesn't have the pair, e.g. because it was listed after the latest release.
+            # Picking routes only needs trading volumes, so a missing market isn't an error there.
+            if all_bars:
+                return None
+            if self.__offline:
+                raise RP2RuntimeError(
+                    f"Kraken's local CSV data has no {pair} market, so its prices aren't available offline. Replace {self.__UNIFIED_CSV_FILE} "
+                    "with a newer release of Kraken's complete OHLCVT data, or turn kraken_csv_offline off to download what's needed from Kraken."
+                )
+            return self.__find_bar_in_trades(pair, epoch_timestamp)
 
         plural: str = "s" if all_bars else ""
         self.__logger.debug("Retrieving cached bar%s for %s, %s at %s", plural, base_asset, quote_asset, epoch_timestamp)
@@ -437,6 +467,12 @@ class Kraken:
         # Newer than Kraken's CSV data for the pair, e.g. in the current quarter
         minute_candles: Optional[_PairStartEnd] = self.__cached_pairs.get(pair + _MINUTE_IN_MINUTES)
         if bars is None and not all_bars and minute_candles is not None and epoch_timestamp > minute_candles.end:
+            if self.__offline:
+                raise RP2RuntimeError(
+                    f"Kraken's local CSV data for {pair} ends at {datetime.fromtimestamp(minute_candles.end, timezone.utc):%Y-%m-%d %H:%M} UTC, so its "
+                    f"price at {timestamp} isn't available offline. Merge Kraken's quarterly update into it with kraken_csv_update_file, or turn "
+                    "kraken_csv_offline off to download newer data from Kraken."
+                )
             return self.__find_bar_in_trades(pair, epoch_timestamp)
         return bars
 
@@ -458,17 +494,20 @@ class Kraken:
 
         csv_files: Dict[str, str] = {}
         source: str
-        if path.exists(self.__UNIFIED_CSV_FILE):
+        if self.__offline:
             self.__logger.info("Attempting to retrieve %s%s pair from the unified Kraken CSV file.", base_asset, quote_asset)
             try:
                 with ZipFile(self.__UNIFIED_CSV_FILE, "r") as zip_ref:
                     for file_name in [name for name in zip_ref.namelist() if is_needed(name)]:
                         self.__logger.debug("Reading in file %s for Kraken CSV pricing.", file_name)
                         csv_files[file_name] = zip_ref.read(file_name).decode(encoding="utf-8")
-            except BadZipFile:
-                self.__logger.warning("The unified CSV file is corrupt, so it has been deleted. Prices will be downloaded from Kraken instead.")
-                self._remove_unified_csv_file()
-                return self._unzip_and_chunk(base_asset, quote_asset, all_bars, timespan)
+            except FileNotFoundError as exc:
+                raise self.__missing_unified_csv_file_error() from exc
+            except (BadZipFile, EOFError, zlib.error) as exc:
+                raise RP2RuntimeError(
+                    f"The unified CSV file {self.__UNIFIED_CSV_FILE} is corrupt ({exc}). Replace it with Kraken's complete OHLCVT data, or turn "
+                    "kraken_csv_offline off to download only what's needed from Kraken."
+                ) from exc
             source = _LOCAL_SOURCE
         else:
             release: KrakenRelease = self.__get_release()
@@ -496,26 +535,11 @@ class Kraken:
 
         save_to_cache(self.cache_key(), self.__cached_pairs)
         save_to_cache(self.__SOURCE_CACHE_KEY, source)
-        if source == _LOCAL_SOURCE:
-            self.__unchunked_assets.discard(base_asset)
-            self.__logger.debug("Leftover assets: %s", self.__unchunked_assets)
-            if len(self.__unchunked_assets) == 0 and self._prompt_delete_confirmation():
-                self._remove_unified_csv_file()
 
         return True
 
-    # Quarterly updates are sometimes released by Kraken before the unified CSV file is updated.
-    # This merges such an update file into the unified CSV file.
+    # Offline, Kraken's quarterly update files are merged into the local unified CSV file, so it doesn't need to be downloaded again
     def __merge_update_file(self, update_file: str) -> None:
-        if not path.exists(self.__UNIFIED_CSV_FILE):
-            self.__logger.warning(
-                "The update file %s wasn't merged, because update files are only merged into a local unified CSV file (%s). Without one, "
-                "prices are downloaded from Kraken's latest release instead. The update file has been kept.",
-                update_file,
-                self.__UNIFIED_CSV_FILE,
-            )
-            return
-
         # Pairs chunked before the merge are missing the new data, so they need to be chunked again.
         # This is done before merging, so that a failed merge can't leave stale pairs cached.
         self.__cached_pairs = {}
@@ -561,28 +585,6 @@ class Kraken:
             # Only exists if something went wrong before the unified file was replaced
             if path.exists(temporary_zip_file):
                 remove(temporary_zip_file)
-
-    def _prompt_delete_confirmation(self) -> bool:
-        self.__logger.info(
-            "\nAll of the CSV files for your assets have been processed. You can probably safely delete the master CSV file "
-            "located at %s. If you add assets later, their prices will be downloaded from Kraken instead.",
-            self.__UNIFIED_CSV_FILE,
-        )
-
-        while True:
-            choice = input("Do you want to delete the file now?[yn]")
-            if choice == "y":
-                return True
-            if choice == "n":
-                return False
-            self.__logger.info("Invalid choice. Please enter y or n.")
-
-    def _remove_unified_csv_file(self) -> None:
-        try:
-            remove(self.__UNIFIED_CSV_FILE)
-            self.__logger.info("%s has been safely deleted.", self.__UNIFIED_CSV_FILE)
-        except FileNotFoundError:
-            self.__logger.info("File %s not found.", self.__UNIFIED_CSV_FILE)
 
     def _get_next_monday(self, date: datetime) -> datetime:
         days_ahead = (DAYS_IN_WEEK - date.weekday()) % DAYS_IN_WEEK

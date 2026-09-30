@@ -254,6 +254,13 @@ class TestAbstractCcxtPairConverterPlugin:
         assert refined_optimizations[datetime(2023, 1, 10)]["A"]["C"] == 2.0
         assert refined_optimizations[datetime(2023, 1, 10)]["A"]["D"] == 1.0
 
+    def test_kraken_csv_update_file_needs_offline_mode(self) -> None:
+        # A configuration mistake, reported when the plugin starts rather than once pricing reaches Kraken
+        with pytest.raises(RP2ValueError, match="kraken_csv_offline"):
+            MockAbstractCcxtPairConverterPlugin(Keyword.HISTORICAL_PRICE_HIGH.value, kraken_csv_update_file="update.zip")
+
+        MockAbstractCcxtPairConverterPlugin(Keyword.HISTORICAL_PRICE_HIGH.value, kraken_csv_update_file="update.zip", kraken_csv_offline=True)
+
     def test_matic_is_priced_from_krakens_historical_market(self) -> None:
         plugin = MockAbstractCcxtPairConverterPlugin(Keyword.HISTORICAL_PRICE_HIGH.value)
         graph: MappedGraph[str] = MappedGraph[str]("Pionex")
