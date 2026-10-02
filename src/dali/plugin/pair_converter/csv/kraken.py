@@ -102,6 +102,18 @@ _CHUNK_SIZE_BYTES: int = 32768  # 32kb
 # Where the cached pairs were read from: the local unified CSV file, or else the name of a Kraken release
 _LOCAL_SOURCE: str = "local unified CSV file"
 
+# Kraken's names for the assets that CCXT, which names the assets DaLI prices, calls differently (see CCXT's commonCurrencies for Kraken).
+# E.g. CCXT's LUNA is Terra 2.0, which Kraken calls LUNA2, while Kraken's LUNA is Terra Classic, which CCXT calls LUNC.
+_KRAKEN_ASSETS: Dict[str, str] = {
+    "BTC": "XBT",
+    "DOGE": "XDG",
+    "LUNA": "LUNA2",
+    "LUNC": "LUNA",
+    "REP": "REPV2",
+    "REPV1": "REP",
+    "USTC": "UST",
+}
+
 # Kraken's REST API only returns its latest 720 candles, so older prices from it come from coarse candles
 _NO_REST_FALLBACK: str = "Kraken's REST API isn't accurate enough to price from instead, so try again once Kraken can be reached."
 _UPDATE_FILE_NEEDS_OFFLINE: str = (
@@ -464,9 +476,9 @@ class Kraken:
     def find_historical_bars(
         self, base_asset: str, quote_asset: str, timestamp: datetime, all_bars: bool = False, timespan: str = _MINUTE_IN_STR
     ) -> Optional[List[HistoricalBar]]:
-        # Kraken refers to BTC as XBT only on it's API
-        if base_asset == "BTC":
-            base_asset = "XBT"
+        # Kraken's CSVs and Trades endpoint use Kraken's names for assets
+        base_asset = _KRAKEN_ASSETS.get(base_asset, base_asset)
+        quote_asset = _KRAKEN_ASSETS.get(quote_asset, quote_asset)
         epoch_timestamp = int(timestamp.timestamp())
         self.__logger.debug("Retrieving bar for %s%s at %s", base_asset, quote_asset, epoch_timestamp)
 

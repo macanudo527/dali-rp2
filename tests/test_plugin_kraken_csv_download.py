@@ -63,6 +63,16 @@ _KRAKEN_TRADES_URL: str = "https://api.kraken.com/0/public/Trades"
 _JANUARY_1: int = 1609459200
 # Timeframes (in minutes) the plugin prices from
 _PRICED_TIMEFRAMES: List[int] = [1, 5, 15, 60, 720, 1440]
+# Prices of markets whose assets Kraken names differently from CCXT, which names the assets DaLI prices
+_KRAKEN_NAMED_PRICES: Dict[str, str] = {
+    "ETHXBT": "0.05",
+    "XDGUSD": "0.07",
+    "LUNA2USD": "1.3179",
+    "LUNAUSD": "0.00015966",
+    "REPV2USD": "12.5",
+    "REPUSD": "11.0",
+    "USTUSD": "0.02",
+}
 
 # Fake Transaction
 FAKE_TRANSACTION: InTransaction = InTransaction(
@@ -98,6 +108,18 @@ def _write_zip(zip_path: Path, csv_files: Dict[str, str]) -> None:
 def _read_zip(zip_path: Path) -> Dict[str, str]:
     with ZipFile(zip_path) as zip_file:
         return {file_name: zip_file.read(file_name).decode(encoding="utf-8") for file_name in zip_file.namelist()}
+
+
+# The CSVs of a pair in every timeframe the plugin prices from, made from its 1 minute candles (time -> price).
+# Each longer candle takes the price of its first minute with trades.
+def _pair_csv_files(pair: str, prices: Dict[int, str]) -> Dict[str, str]:
+    csv_files: Dict[str, str] = {}
+    for minutes in _PRICED_TIMEFRAMES:
+        candles: Dict[int, str] = {}
+        for time, price in sorted(prices.items()):
+            candles.setdefault(time - time % (minutes * 60), price)
+        csv_files[f"{pair}_{minutes}.csv"] = "".join(f"{time},{price},{price},{price},{price},1,1\n" for time, price in candles.items())
+    return csv_files
 
 
 # Byte range [start, end) of each file's local header and data inside a zip file
@@ -819,3 +841,60 @@ class TestKrakenCsvChunksInMemory:
 
         # With room for a single chunk in memory, each lookup reads its chunk file again
         assert self.__chunk_reads(read_spy) == 4
+
+
+class TestKrakenCsvAssetNames:
+    # CCXT names the assets DaLI prices, while Kraken's CSVs and Trades endpoint use Kraken's names for some of them
+    @pytest.mark.parametrize(
+        "base_asset, quote_asset, kraken_pair",
+        [
+            ("ETH", "BTC", "ETHXBT"),
+            ("DOGE", "USD", "XDGUSD"),
+            ("LUNA", "USD", "LUNA2USD"),  # Terra 2.0
+            ("LUNC", "USD", "LUNAUSD"),  # Terra Classic
+            ("REP", "USD", "REPV2USD"),
+            ("REPV1", "USD", "REPUSD"),
+            ("USTC", "USD", "USTUSD"),
+        ],
+    )
+    def test_assets_are_priced_from_their_kraken_markets(self, unified_csv_file: Path, base_asset: str, quote_asset: str, kraken_pair: str) -> None:
+        csv_files: Dict[str, str] = {}
+        for pair, price in _KRAKEN_NAMED_PRICES.items():
+            csv_files.update(_pair_csv_files(pair, {_JANUARY_1: price}))
+        _write_zip(unified_csv_file, csv_files)
+
+        test_bar: Optional[HistoricalBar] = Kraken(transaction_manifest=_manifest(), offline=True).find_historical_bar(
+            base_asset, quote_asset, datetime.fromtimestamp(_JANUARY_1, timezone.utc)
+        )
+
+        assert test_bar
+        assert test_bar.close == RP2Decimal(_KRAKEN_NAMED_PRICES[kraken_pair])
+
+    def test_btc_quoted_markets_are_priced_from_the_release_and_trades(self, kraken_trades: _FakeKrakenServer, tmp_path: Path) -> None:
+        release: Path = tmp_path / "release.zip"
+        _write_zip(release, _pair_csv_files("ETHXBT", {_JANUARY_1 - 60: "0.0305"}))
+        kraken_trades.publish("Kraken_OHLCVT_Full_2020Q4", str(release))
+        kraken_trades.add_trades("ETHXBT", [(_JANUARY_1 + 5, "0.0306", "2.0")])
+        kraken_csv: Kraken = Kraken(transaction_manifest=_manifest())
+
+        # The last minute of the release
+        test_bar: Optional[HistoricalBar] = kraken_csv.find_historical_bar("ETH", "BTC", datetime.fromtimestamp(_JANUARY_1 - 60, timezone.utc))
+        assert test_bar
+        assert test_bar.close == RP2Decimal("0.0305")
+
+        # The first minute after it, from Kraken's trades
+        test_bar = kraken_csv.find_historical_bar("ETH", "BTC", datetime.fromtimestamp(_JANUARY_1, timezone.utc))
+        assert test_bar
+        assert test_bar.close == RP2Decimal("0.0306")
+
+    def test_route_selection_reads_markets_by_their_kraken_names(self, unified_csv_file: Path) -> None:
+        # Daily candles from Thursday 2020-12-17 to Sunday 2020-12-27
+        days: Dict[int, str] = {int(datetime(2020, 12, day, tzinfo=timezone.utc).timestamp()): "0.0305" for day in range(17, 28)}
+        _write_zip(unified_csv_file, _pair_csv_files("ETHXBT", days))
+
+        test_bars: Optional[List[HistoricalBar]] = Kraken(transaction_manifest=_manifest(), offline=True).find_historical_bars(
+            "ETH", "BTC", datetime(2020, 12, 21, tzinfo=timezone.utc), True, "1w"
+        )
+
+        assert test_bars
+        assert test_bars[0].timestamp == datetime(2020, 12, 21, tzinfo=timezone.utc)
