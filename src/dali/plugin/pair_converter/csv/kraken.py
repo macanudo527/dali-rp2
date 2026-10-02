@@ -122,6 +122,16 @@ _UPDATE_FILE_NEEDS_OFFLINE: str = (
 )
 
 DAYS_IN_WEEK: int = 7
+_SECONDS_IN_WEEK: int = _SECONDS_IN_DAY * DAYS_IN_WEEK
+# Emulated weekly candles start on Mondays, unlike weeks counted from the epoch, which start on Thursdays like 1970-01-01
+_FIRST_MONDAY: int = _SECONDS_IN_DAY * 4
+
+
+# Start of the candle of the timeframe (in minutes) that contains the timestamp
+def _candle_start(timestamp: int, timeframe: str) -> int:
+    if timeframe == _ONE_WEEK_IN_MINUTES:
+        return timestamp - (timestamp - _FIRST_MONDAY) % _SECONDS_IN_WEEK
+    return timestamp - timestamp % (int(timeframe) * _SECONDS_IN_MINUTE)
 
 
 class _PairStartEnd(NamedTuple):
@@ -394,7 +404,9 @@ class Kraken:
             self.__logger.debug("No cached pair found for %s, %s", base_asset, quote_asset)
             return None
 
-        while retry_count < len(_KRAKEN_TIME_GRANULARITY):
+        # Prices only come from Kraken's own candles. The emulated weekly candles average the prices of a week, so they're only for picking routes.
+        last_timeframe: int = len(_KRAKEN_TIME_GRANULARITY) if all_bars else len(_KRAKEN_TIME_GRANULARITY) - 1
+        while retry_count < last_timeframe:
             window_start: int = self.__cached_pairs[pair_name + _KRAKEN_TIME_GRANULARITY[retry_count]].start
             window_end: int = self.__cached_pairs[pair_name + _KRAKEN_TIME_GRANULARITY[retry_count]].end
 
@@ -408,9 +420,7 @@ class Kraken:
             file_timestamp: int = (timestamp // duration_chunk_size) * duration_chunk_size
 
             # Floor the timestamp to find the price
-            duration_timestamp: int = (timestamp // (int(_KRAKEN_TIME_GRANULARITY[retry_count]) * _SECONDS_IN_MINUTE)) * (
-                int(_KRAKEN_TIME_GRANULARITY[retry_count]) * _SECONDS_IN_MINUTE
-            )
+            duration_timestamp: int = _candle_start(timestamp, _KRAKEN_TIME_GRANULARITY[retry_count])
 
             while file_timestamp < window_end:
                 file_name: str = f"{base_asset + quote_asset}_{file_timestamp}_{_KRAKEN_TIME_GRANULARITY[retry_count]}.csv.gz"

@@ -898,3 +898,29 @@ class TestKrakenCsvAssetNames:
 
         assert test_bars
         assert test_bars[0].timestamp == datetime(2020, 12, 21, tzinfo=timezone.utc)
+
+
+class TestKrakenCsvWeeklyCandles:
+    # Weekly candles are emulated from daily candles, so they start on Mondays like the weeks of the route snapshots
+    @pytest.mark.parametrize("day", range(21, 28))
+    def test_route_selection_starts_with_the_week_containing_the_time(self, unified_csv_file: Path, day: int) -> None:
+        unified_csv_file.parent.mkdir(parents=True)
+        copyfile(_UNIFIED_FIXTURE, unified_csv_file)
+
+        # Any time from Monday 2020-12-21 to Sunday 2020-12-27
+        test_bars: Optional[List[HistoricalBar]] = Kraken(transaction_manifest=_manifest(), offline=True).find_historical_bars(
+            "BTC", "USD", datetime(2020, 12, day, 12, tzinfo=timezone.utc), True, "1w"
+        )
+
+        assert test_bars
+        assert test_bars[0].timestamp == datetime(2020, 12, 21, tzinfo=timezone.utc)
+        # Sum of the daily volumes of 2020-12-21 to 2020-12-27
+        assert test_bars[0].volume == RP2Decimal("31513.74271325")
+
+    def test_prices_never_come_from_emulated_weekly_candles(self, unified_csv_file: Path) -> None:
+        # Trades on Sunday, Monday and Friday only. The weekly candle averages Monday and Friday, which isn't a price of Thursday.
+        prices: Dict[int, str] = {int(datetime(2020, 12, day, tzinfo=timezone.utc).timestamp()): price for day, price in ((20, "10"), (21, "10"), (25, "20"))}
+        _write_zip(unified_csv_file, _pair_csv_files("ABCUSD", prices))
+
+        # So Thursday has no price from Kraken's CSV data, and the pair converter falls back as documented
+        assert Kraken(transaction_manifest=_manifest(), offline=True).find_historical_bar("ABC", "USD", datetime(2020, 12, 24, 12, tzinfo=timezone.utc)) is None
