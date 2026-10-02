@@ -283,27 +283,24 @@ class Kraken:
                 raise RP2RuntimeError(f"Couldn't reach Kraken's server for its OHLCVT data ({exc}). {_NO_REST_FALLBACK}") from exc
         return self.__release
 
+    # Splits the rows, which are in time order, into one chunk per chunk_size window of time since the epoch that has rows
     def __split_process(self, csv_file: str, chunk_size: int = _CHUNK_SIZE) -> Generator[Tuple[str, List[List[str]]], None, None]:
         chunk: List[List[str]] = []
-
-        lines = reader(csv_file.splitlines())
+        chunk_end: int = 0  # End of the window of the rows in chunk
         position = _PAIR_START
-        next_timestamp: Optional[int] = None
 
-        for line in lines:
-            if next_timestamp is None:
-                next_timestamp = ((int(line[self.__TIMESTAMP_INDEX]) + chunk_size) // chunk_size) * chunk_size
-
-            if int(line[self.__TIMESTAMP_INDEX]) % chunk_size == 0 or int(line[self.__TIMESTAMP_INDEX]) > next_timestamp:
+        for line in reader(csv_file.splitlines()):
+            timestamp: int = int(line[self.__TIMESTAMP_INDEX])
+            if chunk and timestamp >= chunk_end:
                 yield position, chunk
-                if position == _PAIR_START:
-                    position = _PAIR_MIDDLE
+                position = _PAIR_MIDDLE
                 chunk = []
-                next_timestamp += chunk_size
+            if not chunk:
+                # Windows without rows are skipped, so the window is the one of this row rather than the next one
+                chunk_end = (timestamp // chunk_size + 1) * chunk_size
             chunk.append(line)
         if chunk:
-            position = _PAIR_END
-            yield position, chunk
+            yield _PAIR_END, chunk
 
     def _split_chunks_size_n(self, file_name: str, csv_file: str, chunk_size: int = _CHUNK_SIZE) -> None:
         pair, duration_in_minutes = file_name.strip(".csv").split("_", 1)

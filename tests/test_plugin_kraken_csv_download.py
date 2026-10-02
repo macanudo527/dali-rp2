@@ -924,3 +924,32 @@ class TestKrakenCsvWeeklyCandles:
 
         # So Thursday has no price from Kraken's CSV data, and the pair converter falls back as documented
         assert Kraken(transaction_manifest=_manifest(), offline=True).find_historical_bar("ABC", "USD", datetime(2020, 12, 24, 12, tzinfo=timezone.utc)) is None
+
+
+class TestKrakenCsvChunking:
+    def test_pair_whose_first_candle_starts_a_chunk_can_be_priced(self, unified_csv_file: Path) -> None:
+        # Chunk files hold 30 days of 1 minute candles, starting at multiples of 30 days since the epoch: 2020-12-04 00:00 UTC is one
+        chunk_start: int = 620 * 30 * 86400
+        _write_zip(unified_csv_file, _pair_csv_files("ABCUSD", {chunk_start: "10", chunk_start + 60: "11"}))
+
+        test_bar: Optional[HistoricalBar] = Kraken(transaction_manifest=_manifest(), offline=True).find_historical_bar(
+            "ABC", "USD", datetime.fromtimestamp(chunk_start, timezone.utc)
+        )
+
+        assert test_bar
+        assert test_bar.duration == timedelta(minutes=1)
+        assert test_bar.close == RP2Decimal("10")
+
+    def test_candles_after_a_long_gap_can_be_priced(self, unified_csv_file: Path) -> None:
+        # No trades for 70 days, longer than a whole chunk file of 1 minute candles
+        before_gap: int = 1600000020
+        after_gap: int = before_gap + 70 * 86400
+        prices: Dict[int, str] = {before_gap: "10", after_gap: "20", after_gap + 60: "21", after_gap + 120: "22"}
+        _write_zip(unified_csv_file, _pair_csv_files("ABCUSD", prices))
+        kraken_csv: Kraken = Kraken(transaction_manifest=_manifest(), offline=True)
+
+        for time, price in prices.items():
+            test_bar: Optional[HistoricalBar] = kraken_csv.find_historical_bar("ABC", "USD", datetime.fromtimestamp(time, timezone.utc))
+            assert test_bar, time
+            assert test_bar.duration == timedelta(minutes=1), time
+            assert test_bar.close == RP2Decimal(price), time
